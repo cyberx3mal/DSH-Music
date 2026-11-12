@@ -2,7 +2,7 @@
   "name": "@local/music-board",
   "version": "1.0.0",
   "private": true,
-  "description": "Left-sidebar music widget: every media source playing on this PC, with play/pause, previous/next, status filters, and a collapsible strip.",
+  "description": "Left-sidebar music widget: a now-playing card with cover art for every media source on this PC, play/pause, previous/next, other sources, and a collapsible strip with quick controls. Cover art uses Apple iTunes, Deezer and MusicBrainz/Cover Art Archive with generated fallback.",
   "type": "module",
   "exports": {
     ".": "./index.js",

@@ -44,6 +44,8 @@ const ART_FETCH_TIMEOUT_MS = 5000
 /** Services this half needs; without Connection it stays inactive. */
 export const inject = ['connection']
 
+export { appleArtwork, deezerArtwork, fetchArtwork, musicBrainzArtwork }
+
 /** Snapshot sent before any state exists. */
 function pendingSnapshot() {
   return { supported: true, ready: false, sessions: [], at: Date.now() }
@@ -152,17 +154,216 @@ function normalizedText(value) {
     .trim()
 }
 
-/** Whether one iTunes result describes the current track. */
-function matchesResult(result, session) {
-  if (result === null || typeof result !== 'object') return false
+/** Whether a candidate title/artist describes the current track. */
+function matchesNames(resultTitle, resultArtist, session) {
   const title = normalizedText(session.title)
-  const resultTitle = normalizedText(result.trackName)
-  if (title === '' || resultTitle === '') return false
-  if (!resultTitle.includes(title) && !title.includes(resultTitle)) return false
+  const candidateTitle = normalizedText(resultTitle)
+  if (title === '' || candidateTitle === '') return false
+  if (!candidateTitle.includes(title) && !title.includes(candidateTitle)) return false
   const artist = normalizedText(session.artist)
-  const resultArtist = normalizedText(result.artistName)
-  if (artist === '' || resultArtist === '') return true
-  return resultArtist.includes(artist) || artist.includes(resultArtist)
+  const candidateArtist = normalizedText(resultArtist)
+  if (artist === '' || candidateArtist === '') return true
+  return candidateArtist.includes(artist) || artist.includes(candidateArtist)
+}
+
+/** User agent required by MusicBrainz and polite for the other catalogs. */
+const ART_USER_AGENT = 'DSH-Music/1.0 (+https://github.com/cyberx3mal/DSH-Music)'
+const MUSICBRAINZ_MIN_INTERVAL_MS = 1100
+let musicBrainzQueue = Promise.resolve()
+let musicBrainzLastAt = 0
+
+/** Combined artist and title search term. */
+function termOf(session) {
+  return [text(session?.artist, 200), text(session?.title, 240)].filter(Boolean).join(' ').trim()
+}
+
+/** Escape a value for a Lucene query. */
+function escapeLucene(value) {
+  return text(value, 240).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+/**
+ * Search the iTunes catalog.
+ * @param session - current track.
+ * @param country - optional storefront, such as RU.
+ * @returns an artwork candidate, or undefined.
+ */
+async function appleArtwork(session, country) {
+  const term = termOf(session)
+  if (term === '') return undefined
+  const params = new URLSearchParams({ term, entity: 'song', limit: '5' })
+  if (country) params.set('country', country)
+  const response = await fetch(`https://itunes.apple.com/search?${params.toString()}`, {
+    headers: { accept: 'application/json', 'user-agent': ART_USER_AGENT },
+    signal: AbortSignal.timeout(ART_FETCH_TIMEOUT_MS),
+  })
+  if (!response.ok) return undefined
+  const payload = await response.json().catch(() => undefined)
+  const results = Array.isArray(payload?.results) ? payload.results : []
+  const chosen = results.find(
+    result =>
+      matchesNames(result?.trackName, result?.artistName, session) &&
+      typeof result?.artworkUrl100 === 'string',
+  )
+  if (chosen === undefined) return undefined
+  return { urls: [chosen.artworkUrl100], hosts: ['mzstatic.com'] }
+}
+
+/**
+ * Search Deezer's public catalog.
+ * @param session - current track.
+ * @returns an artwork candidate, or undefined.
+ */
+async function deezerArtwork(session) {
+  const term = termOf(session)
+  if (term === '') return undefined
+  const response = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(term)}&limit=5`, {
+    headers: { accept: 'application/json', 'user-agent': ART_USER_AGENT },
+    signal: AbortSignal.timeout(ART_FETCH_TIMEOUT_MS),
+  })
+  if (!response.ok) return undefined
+  const payload = await response.json().catch(() => undefined)
+  const results = Array.isArray(payload?.data) ? payload.data : []
+  const chosen = results.find(item => {
+    if (item === null || typeof item !== 'object') return false
+    if (!matchesNames(item.title, item.artist?.name, session)) return false
+    return item.album !== null && typeof item.album === 'object' && typeof item.album.cover_medium === 'string'
+  })
+  if (chosen === undefined) return undefined
+  return { urls: [chosen.album.cover_medium], hosts: ['dzcdn.net'] }
+}
+
+/** Serialize MusicBrainz calls to its one-request-per-second etiquette. */
+function queueMusicBrainz(task) {
+  const run = async () => {
+    const wait = Math.max(0, MUSICBRAINZ_MIN_INTERVAL_MS - (Date.now() - musicBrainzLastAt))
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait))
+    musicBrainzLastAt = Date.now()
+    return task()
+  }
+  const next = musicBrainzQueue.then(run, run)
+  musicBrainzQueue = next.then(() => undefined, () => undefined)
+  return next
+}
+
+/**
+ * Search MusicBrainz for an official release and use Cover Art Archive.
+ * @param session - current track.
+ * @returns an artwork candidate with release-group and release URLs.
+ */
+async function musicBrainzArtwork(session) {
+  const title = text(session?.title, 240)
+  if (title === '') return undefined
+  const artist = text(session?.artist, 200)
+  const albumTitle = text(session?.album, 200)
+  const album = normalizedText(albumTitle)
+  const query = `recording:"${escapeLucene(title)}"` + (artist === '' ? '' : ` AND artist:"${escapeLucene(artist)}"`)
+  const response = await queueMusicBrainz(() =>
+    fetch(
+      `https://musicbrainz.org/ws/2/recording/?query=${encodeURIComponent(query)}&fmt=json&limit=10`,
+      {
+        headers: { accept: 'application/json', 'user-agent': ART_USER_AGENT },
+        signal: AbortSignal.timeout(ART_FETCH_TIMEOUT_MS),
+      },
+    ),
+  )
+  const payload = response.ok ? await response.json().catch(() => undefined) : undefined
+  const recordings = Array.isArray(payload?.recordings) ? payload.recordings : []
+  let best
+  let bestScore = -1
+  for (const recording of recordings) {
+    if (recording === null || typeof recording !== 'object') continue
+    const credit = Array.isArray(recording['artist-credit'])
+      ? recording['artist-credit'].map(entry => entry?.name ?? entry?.artist?.name ?? '').join(' ')
+      : ''
+    if (!matchesNames(recording.title, credit, session)) continue
+    for (const release of Array.isArray(recording.releases) ? recording.releases : []) {
+      if (release === null || typeof release !== 'object' || release.status !== 'Official') continue
+      const group = release['release-group']
+      const groupId = typeof group?.id === 'string' ? group.id : ''
+      const releaseId = typeof release.id === 'string' ? release.id : ''
+      if (groupId === '' && releaseId === '') continue
+      const groupTitle = normalizedText(group?.title ?? release.title)
+      const groupType = typeof group?.['primary-type'] === 'string' ? group['primary-type'] : ''
+      let score = 4
+      if (groupType === 'Album') score += 2
+      if (album !== '' && groupTitle !== '' && (groupTitle.includes(album) || album.includes(groupTitle))) {
+        score += 6
+      }
+      if (score > bestScore) {
+        bestScore = score
+        best = { groupId, releaseId }
+      }
+    }
+  }
+  if (best === undefined && albumTitle !== '') {
+    const groupQuery =
+      `releasegroup:"${escapeLucene(albumTitle)}"` + (artist === '' ? '' : ` AND artist:"${escapeLucene(artist)}"`)
+    const groupResponse = await queueMusicBrainz(() =>
+      fetch(
+        `https://musicbrainz.org/ws/2/release-group/?query=${encodeURIComponent(groupQuery)}&fmt=json&limit=5`,
+        {
+          headers: { accept: 'application/json', 'user-agent': ART_USER_AGENT },
+          signal: AbortSignal.timeout(ART_FETCH_TIMEOUT_MS),
+        },
+      ),
+    )
+    if (groupResponse.ok) {
+      const groupPayload = await groupResponse.json().catch(() => undefined)
+      const groups = Array.isArray(groupPayload?.['release-groups']) ? groupPayload['release-groups'] : []
+      const chosen = groups.find(group => {
+        if (group === null || typeof group !== 'object' || group['primary-type'] !== 'Album') return false
+        if (Array.isArray(group['secondary-types']) && group['secondary-types'].includes('Live')) return false
+        const credit = Array.isArray(group['artist-credit'])
+          ? group['artist-credit'].map(entry => entry?.name ?? entry?.artist?.name ?? '').join(' ')
+          : ''
+        return matchesNames(group.title, credit, { ...session, title: albumTitle })
+      })
+      if (chosen !== undefined && typeof chosen.id === 'string') {
+        const release = Array.isArray(chosen.releases)
+          ? chosen.releases.find(item => item?.status === 'Official' && typeof item.id === 'string')
+          : undefined
+        best = { groupId: chosen.id, releaseId: release?.id ?? '' }
+      }
+    }
+  }
+  if (best === undefined) return undefined
+  const urls = []
+  if (best.groupId !== '') urls.push(`https://coverartarchive.org/release-group/${encodeURIComponent(best.groupId)}/front-250`)
+  if (best.releaseId !== '') urls.push(`https://coverartarchive.org/release/${encodeURIComponent(best.releaseId)}/front-250`)
+  return { urls, hosts: ['coverartarchive.org', 'archive.org'] }
+}
+
+/**
+ * Download the first usable image from a provider candidate.
+ * @param candidate - `{ urls, hosts }`.
+ * @returns a data URL, or undefined.
+ */
+async function fetchArtwork(candidate) {
+  if (candidate === null || typeof candidate !== 'object' || !Array.isArray(candidate.urls)) return undefined
+  for (const raw of candidate.urls) {
+    if (typeof raw !== 'string') continue
+    try {
+      const url = new URL(raw)
+      if (url.protocol !== 'https:') continue
+      const allowed = host => candidate.hosts.some(item => host === item || host.endsWith(`.${item}`))
+      if (!allowed(url.hostname)) continue
+      const response = await fetch(url, {
+        headers: { accept: 'image/*', 'user-agent': ART_USER_AGENT },
+        signal: AbortSignal.timeout(ART_FETCH_TIMEOUT_MS),
+      })
+      if (!response.ok) continue
+      if (!allowed(new URL(response.url).hostname)) continue
+      const mediaType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+      if (!mediaType.startsWith('image/')) continue
+      const bytes = Buffer.from(await response.arrayBuffer())
+      if (bytes.length === 0 || bytes.length > ART_MAX_BYTES) continue
+      return `data:${mediaType};base64,${bytes.toString('base64')}`
+    } catch {
+      // Try the next candidate URL.
+    }
+  }
+  return undefined
 }
 
 /**
@@ -254,50 +455,45 @@ class MusicHub {
   }
 
   /**
-   * Find a conservative iTunes match and cache its artwork as a data URL.
-   * Track title and artist leave the machine only for this lookup; the cache
-   * keeps repeated snapshots offline.
+   * Try Apple, Deezer and MusicBrainz in order and cache the first usable
+   * artwork. Track title and artist leave the machine only for these lookups;
+   * the cache keeps repeated snapshots offline.
    * @param session - session with title and artist.
    * @param key - art cache key.
    */
   async lookupArt(session, key) {
     try {
-      const term = [session.artist, session.title].filter(Boolean).join(' ')
-      if (term.trim() === '') {
+      if (termOf(session) === '') {
         this.artCache.set(key, { art: '', at: Date.now() })
         return
       }
-      const endpoint = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&entity=song&limit=5`
-      const response = await fetch(endpoint, {
-        headers: { accept: 'application/json' },
-        signal: AbortSignal.timeout(ART_FETCH_TIMEOUT_MS),
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const payload = await response.json()
-      const results = Array.isArray(payload?.results) ? payload.results : []
-      const chosen = results.find(result => matchesResult(result, session))
-      if (chosen === undefined || typeof chosen.artworkUrl100 !== 'string') {
+      const providers = [
+        () => appleArtwork(session, ''),
+        () => appleArtwork(session, 'RU'),
+        () => deezerArtwork(session),
+        () => musicBrainzArtwork(session),
+      ]
+      let art
+      for (const provider of providers) {
+        if (this.disposed) break
+        let candidate
+        try {
+          candidate = await provider()
+        } catch {
+          candidate = undefined
+        }
+        if (candidate === undefined) continue
+        art = await fetchArtwork(candidate)
+        if (art !== undefined) break
+      }
+      if (art === undefined) {
         this.artCache.set(key, { art: '', at: Date.now() })
-        return
-      }
-      const artwork = new URL(chosen.artworkUrl100)
-      if (artwork.protocol !== 'https:' || !/(^|\.)mzstatic\.com$/i.test(artwork.hostname)) {
-        throw new Error('unexpected artwork host')
-      }
-      const image = await fetch(artwork, {
-        headers: { accept: 'image/*' },
-        signal: AbortSignal.timeout(ART_FETCH_TIMEOUT_MS),
-      })
-      if (!image.ok) throw new Error(`art HTTP ${image.status}`)
-      const mediaType = image.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() ?? ''
-      if (!mediaType.startsWith('image/')) throw new Error('art is not an image')
-      const bytes = Buffer.from(await image.arrayBuffer())
-      if (bytes.length === 0 || bytes.length > ART_MAX_BYTES) throw new Error('art is too large')
-      const art = `data:${mediaType};base64,${bytes.toString('base64')}`
-      this.artCache.set(key, { art, at: Date.now() })
-      if (this.artCache.size > ART_CACHE_LIMIT) {
-        const oldest = this.artCache.keys().next().value
-        if (oldest !== undefined) this.artCache.delete(oldest)
+      } else {
+        this.artCache.set(key, { art, at: Date.now() })
+        if (this.artCache.size > ART_CACHE_LIMIT) {
+          const oldest = this.artCache.keys().next().value
+          if (oldest !== undefined) this.artCache.delete(oldest)
+        }
       }
     } catch {
       this.artCache.set(key, { art: '', at: Date.now() })
