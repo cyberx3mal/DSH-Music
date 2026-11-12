@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
         systemVolume: 'System volume',
         mute: 'Mute',
         unmute: 'Unmute',
+        seek: 'Seek',
         progress: 'Playback position',
         progressValue: '{position} of {duration}',
         actionFailed: 'Could not control the player.',
@@ -59,6 +60,7 @@ window.__ModuleLoader__.load({
         systemVolume: 'Системная громкость',
         mute: 'Выключить звук',
         unmute: 'Включить звук',
+        seek: 'Перемотка',
         progress: 'Позиция воспроизведения',
         progressValue: '{position} из {duration}',
         actionFailed: 'Не удалось управлять плеером.',
@@ -221,7 +223,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const action = async (id, appId, verb) => {
+      const action = async (id, appId, verb, positionMs) => {
         if (typeof id !== 'string' || id === '') return { ok: false, error: 'invalid-target' }
         if (typeof appId !== 'string' || appId === '') return { ok: false, error: 'invalid-target' }
         try {
@@ -230,7 +232,11 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             credentials: 'same-origin',
             cache: 'no-store',
-            body: JSON.stringify({ id, appId, action: verb }),
+            body: JSON.stringify(
+              Number.isFinite(positionMs)
+                ? { id, appId, action: verb, positionMs }
+                : { id, appId, action: verb },
+            ),
           })
           if (!response.ok) return { ok: false, error: `HTTP ${response.status}` }
           const answer = await response.json()
@@ -677,8 +683,13 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState(null)
       const [volume, setVolume] = React.useState(null)
       const [muted, setMuted] = React.useState(false)
+      const [volumeOpen, setVolumeOpen] = React.useState(false)
+      const [volumeAnchor, setVolumeAnchor] = React.useState({ left: 0, top: 0, width: 184 })
+      const [scrub, setScrub] = React.useState(null)
       const timers = React.useRef(new Set())
       const volumeTimer = React.useRef(null)
+      const scrubTimer = React.useRef(null)
+      const volumePopRef = React.useRef(null)
 
       const view = React.useMemo(() => deriveView(snapshot.sessions), [snapshot])
       const primary = view.rows.find(session => session.id === selectedId) ?? view.primary
@@ -692,6 +703,7 @@ window.__ModuleLoader__.load({
           for (const timer of timers.current) clearTimeout(timer)
           timers.current.clear()
           if (volumeTimer.current !== null) clearTimeout(volumeTimer.current)
+          if (scrubTimer.current !== null) clearTimeout(scrubTimer.current)
         },
         [],
       )
@@ -711,6 +723,25 @@ window.__ModuleLoader__.load({
       }, [music])
 
       React.useEffect(() => {
+        if (!volumeOpen) return undefined
+        const onPointerDown = event => {
+          const popover = volumePopRef.current
+          if (popover !== null && popover.contains(event.target)) return
+          if (event.target instanceof Element && event.target.closest('[data-volume-button="true"]') !== null) return
+          setVolumeOpen(false)
+        }
+        const onKeyDown = event => {
+          if (event.key === 'Escape') setVolumeOpen(false)
+        }
+        document.addEventListener('pointerdown', onPointerDown, true)
+        document.addEventListener('keydown', onKeyDown)
+        return () => {
+          document.removeEventListener('pointerdown', onPointerDown, true)
+          document.removeEventListener('keydown', onKeyDown)
+        }
+      }, [volumeOpen])
+
+      React.useEffect(() => {
         if (error === null) return undefined
         const timer = setTimeout(() => setError(null), 4000)
         return () => clearTimeout(timer)
@@ -720,6 +751,7 @@ window.__ModuleLoader__.load({
       if (!snapshot.ready || !snapshot.supported || snapshot.sessions.length === 0) return null
 
       const toggleCollapsed = () => {
+        setVolumeOpen(false)
         const next = !collapsed
         setCollapsed(next)
         writeCollapsedPreference(next)
@@ -789,6 +821,85 @@ window.__ModuleLoader__.load({
         })
       }
 
+      const toggleVolumePopover = event => {
+        if (volumeOpen) {
+          setVolumeOpen(false)
+          return
+        }
+        if (typeof window === 'undefined') return
+        const rect = event.currentTarget.getBoundingClientRect()
+        const width = Math.min(184, Math.max(120, window.innerWidth - 16))
+        const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width))
+        const top = rect.top - 58 >= 8 ? rect.top - 58 : rect.bottom + 6
+        setVolumeAnchor({ left, top, width })
+        setVolumeOpen(true)
+      }
+
+      const commitSeek = (session, value) => {
+        const target = Math.max(0, Math.min(session.durationMs, Math.round(value)))
+        setScrub({ id: session.id, value: target })
+        if (scrubTimer.current !== null) clearTimeout(scrubTimer.current)
+        void music.action(session.id, session.appId, 'seek', target).then(answer => {
+          if (answer === null || answer.ok !== true) {
+            setError({ text: tr('actionFailed'), id: Date.now() })
+          }
+        })
+        scrubTimer.current = setTimeout(() => {
+          scrubTimer.current = null
+          setScrub(null)
+        }, 1600)
+      }
+
+      const volumeButton = h(
+        'button',
+        {
+          type: 'button',
+          className: 'mb-volumeButton',
+          'data-volume-button': 'true',
+          'data-muted': muted ? 'true' : 'false',
+          'aria-label': tr('volume'),
+          title: tr('systemVolume'),
+          onClick: toggleVolumePopover,
+        },
+        h(VolumeIcon, { muted }),
+      )
+
+      const volumePopover = volumeOpen
+        ? h(
+            'div',
+            {
+              ref: volumePopRef,
+              className: 'mb-volumePop',
+              style: { left: volumeAnchor.left, top: volumeAnchor.top, width: volumeAnchor.width },
+            },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'mb-volumeButton',
+                'data-muted': muted ? 'true' : 'false',
+                'aria-label': muted ? tr('unmute') : tr('mute'),
+                title: muted ? tr('unmute') : tr('mute'),
+                onClick: toggleMute,
+              },
+              h(VolumeIcon, { muted }),
+            ),
+            h('input', {
+              type: 'range',
+              className: 'mb-volumeRange',
+              min: 0,
+              max: 100,
+              step: 1,
+              value: volume ?? 0,
+              disabled: volume === null,
+              'aria-label': tr('volume'),
+              title: tr('systemVolume'),
+              onChange: event => applyVolume(Number(event.target.value)),
+            }),
+            h('span', { className: 'mb-volumeValue' }, volume === null ? '—' : `${volume}%`),
+          )
+        : null
+
       const cover = (session, hero) => {
         const playing = session.status === 'playing'
         return h(
@@ -852,6 +963,7 @@ window.__ModuleLoader__.load({
                 },
                 h(SkipIcon, { direction: 'next' }),
               ),
+              volumeButton,
             )
           : null
 
@@ -859,7 +971,9 @@ window.__ModuleLoader__.load({
         const title = session.title || tr('noTitle')
         const app = appNameOf(session)
         const tone = coverTone(session)
-        const position = displayedPosition(session, snapshot.at, now)
+        const basePosition = displayedPosition(session, snapshot.at, now)
+        const position = scrub !== null && scrub.id === session.id ? scrub.value : basePosition
+        const seekable = session.durationMs > 0 && session.canSeek === true
         const rawElapsed = formatClock(position)
         const duration = formatClock(session.durationMs)
         const elapsed = rawElapsed !== '' ? rawElapsed : duration !== '' ? '0:00' : ''
@@ -891,19 +1005,41 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'mb-heroProgress' },
                 h('span', { className: 'mb-time' }, elapsed !== '' ? elapsed : '0:00'),
-                h(
-                  'div',
-                  {
-                    className: 'mb-progress',
-                    role: 'progressbar',
-                    'aria-label': tr('progress'),
-                    'aria-valuemin': 0,
-                    'aria-valuemax': 100,
-                    'aria-valuenow': Math.round(percent),
-                    'aria-valuetext': tr('progressValue', { position: elapsed !== '' ? elapsed : '0:00', duration }),
-                  },
-                  h('span', { className: 'mb-progressFill', style: { width: percent.toFixed(1) + '%' } }),
-                ),
+                seekable
+                  ? h('input', {
+                      type: 'range',
+                      className: 'mb-seek',
+                      min: 0,
+                      max: session.durationMs,
+                      step: 1000,
+                      value: Math.round(position),
+                      style: { '--mb-seek': percent.toFixed(1) + '%' },
+                      'aria-label': tr('seek'),
+                      'aria-valuetext': tr('progressValue', {
+                        position: elapsed !== '' ? elapsed : '0:00',
+                        duration,
+                      }),
+                      onChange: event => setScrub({ id: session.id, value: Number(event.target.value) }),
+                      onPointerUp: event => commitSeek(session, Number(event.currentTarget.value)),
+                      onKeyUp: event => {
+                        if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) {
+                          commitSeek(session, Number(event.currentTarget.value))
+                        }
+                      },
+                    })
+                  : h(
+                      'div',
+                      {
+                        className: 'mb-progress',
+                        role: 'progressbar',
+                        'aria-label': tr('progress'),
+                        'aria-valuemin': 0,
+                        'aria-valuemax': 100,
+                        'aria-valuenow': Math.round(percent),
+                        'aria-valuetext': tr('progressValue', { position: elapsed !== '' ? elapsed : '0:00', duration }),
+                      },
+                      h('span', { className: 'mb-progressFill', style: { width: percent.toFixed(1) + '%' } }),
+                    ),
                 h('span', { className: 'mb-time' }, duration),
               )
             : null,
@@ -948,36 +1084,6 @@ window.__ModuleLoader__.load({
               h(SkipIcon, { direction: 'next' }),
             ),
           ),
-          volume !== null
-            ? h(
-                'div',
-                { className: 'mb-volume' },
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'mb-volumeButton',
-                    'data-muted': muted ? 'true' : 'false',
-                    'aria-label': muted ? tr('unmute') : tr('mute'),
-                    title: muted ? tr('unmute') : tr('mute'),
-                    onClick: toggleMute,
-                  },
-                  h(VolumeIcon, { muted }),
-                ),
-                h('input', {
-                  type: 'range',
-                  className: 'mb-volumeRange',
-                  min: 0,
-                  max: 100,
-                  step: 1,
-                  value: volume,
-                  'aria-label': tr('volume'),
-                  title: tr('systemVolume'),
-                  onChange: event => applyVolume(Number(event.target.value)),
-                }),
-                h('span', { className: 'mb-volumeValue' }, `${volume}%`),
-              )
-            : null,
         )
       }
 
@@ -1059,15 +1165,20 @@ window.__ModuleLoader__.load({
               headControls,
             )
           : h(
-              'button',
-              {
-                type: 'button',
-                className: 'mb-collapse',
-                title: tr('collapseWidget'),
-                'aria-label': tr('collapseWidget'),
-                onClick: toggleCollapsed,
-              },
-              h(Chevron, { open: false }),
+              'div',
+              { className: 'mb-topActions' },
+              volumeButton,
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'mb-collapse',
+                  title: tr('collapseWidget'),
+                  'aria-label': tr('collapseWidget'),
+                  onClick: toggleCollapsed,
+                },
+                h(Chevron, { open: false }),
+              ),
             ),
         collapsed
           ? null
@@ -1085,6 +1196,7 @@ window.__ModuleLoader__.load({
                   )
                 : null,
             ),
+        volumePopover,
       )
     }
 
@@ -1107,7 +1219,7 @@ window.__ModuleLoader__.load({
 .mb-headArtist{flex:0 1 auto;min-width:0;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;color:var(--dsw-alias-label-secondary);}
 .mb-headSep{flex:none;font-size:10px;line-height:16px;color:var(--dsw-alias-label-tertiary);}
 .mb-headTitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;line-height:16px;font-weight:500;color:var(--dsw-alias-label-primary);}
-.mb-collapse{position:absolute;top:5px;right:5px;z-index:3;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
+.mb-topActions{position:absolute;top:5px;right:5px;z-index:3;display:flex;align-items:center;gap:1px;}\n.mb-collapse{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
 @media (hover:hover){.mb-collapse:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-collapse:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-collapse .mb-chevronIcon{transform:rotate(90deg);}
@@ -1131,7 +1243,7 @@ window.__ModuleLoader__.load({
 .mb-foot[data-single='true'] .mb-list{max-height:none;overflow:visible;}
 .mb-hero{position:relative;display:flex;flex-direction:column;padding:2px 2px 1px;margin:0;border:0;background:transparent;box-shadow:none;overflow:visible;}
 .mb-hero::before{content:'';position:absolute;top:-28px;left:-18px;width:150px;height:130px;border-radius:999px;background:radial-gradient(circle,color-mix(in srgb,var(--mb-color,var(--dsw-alias-brand-primary)) 22%,transparent),transparent 70%);pointer-events:none;}
-.mb-heroTop{position:relative;z-index:1;display:flex;align-items:center;gap:11px;min-width:0;padding-right:24px;}
+.mb-heroTop{position:relative;z-index:1;display:flex;align-items:center;gap:11px;min-width:0;padding-right:50px;}
 .mb-cover{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none;border-radius:9px;color:var(--dsw-alias-label-primary);overflow:hidden;}
 .mb-coverHero{width:56px;height:56px;border-radius:13px;box-shadow:0 6px 18px color-mix(in srgb,var(--mb-color,var(--dsw-alias-brand-primary)) 26%,transparent),inset 0 0 0 .5px color-mix(in srgb,var(--dsw-alias-label-primary) 14%,transparent);}
 .mb-coverSmall{width:30px;height:30px;border-radius:8px;}
@@ -1157,7 +1269,7 @@ window.__ModuleLoader__.load({
 .mb-heroProgress{position:relative;z-index:1;display:flex;align-items:center;gap:8px;margin-top:10px;}
 .mb-time{font-size:10px;line-height:12px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;flex:none;min-width:25px;}
 .mb-time:last-child{text-align:right;}
-.mb-progress{flex:1;height:4px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);overflow:hidden;}
+.mb-progress{flex:1;height:4px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);overflow:hidden;}\n.mb-seek{flex:1;min-width:0;height:4px;-webkit-appearance:none;appearance:none;border:0;border-radius:999px;background:linear-gradient(90deg,var(--mb-color) 0 var(--mb-seek,0%),color-mix(in srgb,var(--dsw-alias-label-primary) 12%,transparent) var(--mb-seek,0%) 100%);outline:none;cursor:pointer;}\n.mb-seek::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:10px;height:10px;border-radius:999px;background:var(--mb-color);box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-alias-bg-layer-1) 85%,transparent);}\n.mb-seek::-moz-range-thumb{width:10px;height:10px;border:0;border-radius:999px;background:var(--mb-color);}\n.mb-seek:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:3px;}
 .mb-progressFill{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--mb-color),color-mix(in srgb,var(--mb-color) 45%,var(--dsw-alias-state-success-primary)));transition:width .45s linear;}
 .mb-heroControls{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px;padding:0 4px;}
 .mb-transportButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);padding:0;cursor:pointer;}
@@ -1171,7 +1283,6 @@ window.__ModuleLoader__.load({
 .mb-playButton:active{transform:scale(.97);}
 .mb-playButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px;}
 .mb-playButton:disabled{cursor:default;opacity:.45;box-shadow:none;transform:none;}
-.mb-volume{position:relative;z-index:1;display:flex;align-items:center;gap:7px;margin-top:8px;padding:0 4px;}
 .mb-volumeButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
 @media (hover:hover){.mb-volumeButton:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-volumeButton[data-muted='true']{color:var(--mb-color);}
@@ -1180,7 +1291,7 @@ window.__ModuleLoader__.load({
 .mb-volumeRange::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:10px;height:10px;border-radius:999px;background:var(--mb-color);box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-alias-bg-layer-1) 85%,transparent);}
 .mb-volumeRange::-moz-range-thumb{width:10px;height:10px;border:0;border-radius:999px;background:var(--mb-color);}
 .mb-volumeRange:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:3px;}
-.mb-volumeValue{flex:none;min-width:28px;text-align:right;font-size:9.5px;line-height:12px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;}
+.mb-volumeValue{flex:none;min-width:28px;text-align:right;font-size:9.5px;line-height:12px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;}\n.mb-volumePop{position:fixed;z-index:1000;box-sizing:border-box;display:flex;align-items:center;gap:7px;padding:7px 8px;border:.5px solid color-mix(in srgb,var(--mb-color) 34%,var(--dsw-alias-border-l1));border-radius:9px;background:var(--dsw-alias-bg-layer-1);box-shadow:0 6px 20px color-mix(in srgb,var(--dsw-alias-label-primary) 16%,transparent);}\n.mb-volumePop .mb-volumeValue{min-width:30px;}
 .mb-sectionLabel{padding:9px 3px 3px;font-size:8.5px;line-height:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--dsw-alias-label-tertiary);border-top:.5px solid color-mix(in srgb,var(--mb-color,var(--dsw-alias-border-l2)) 32%,var(--dsw-alias-border-l2));margin-top:6px;}
 .mb-other{display:flex;align-items:center;gap:2px;border-radius:8px;min-width:0;}
 @media (hover:hover){.mb-other:hover{background:var(--dsw-alias-interactive-bg-hover);}}

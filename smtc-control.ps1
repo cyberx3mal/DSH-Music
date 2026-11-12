@@ -7,7 +7,8 @@
 param(
   [Parameter(Mandatory = $true)][string]$AppId,
   [Parameter(Mandatory = $true)][string]$Action,
-  [int]$Index = 0
+  [int]$Index = 0,
+  [long]$PositionMs = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,6 +60,10 @@ try {
     'pause' { $ok = Await ($session.TryPauseAsync()) ([bool]) }
     'next' { $ok = Await ($session.TrySkipNextAsync()) ([bool]) }
     'previous' { $ok = Await ($session.TrySkipPreviousAsync()) ([bool]) }
+    'seek' {
+      $ticks = [long]([Math]::Max(0, [Math]::Min(86400000, $PositionMs)) * 10000)
+      $ok = Await ($session.TryChangePlaybackPositionAsync($ticks)) ([bool])
+    }
     default {
       Write-Payload @{ ok = $false; error = 'unknown-action' }
       exit 0

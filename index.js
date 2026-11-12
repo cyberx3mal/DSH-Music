@@ -35,7 +35,7 @@ const MAX_LINE_BYTES = 512 * 1024
 const IDLE_STOP_MS = 5000
 const RESTART_DELAYS_MS = [500, 1500, 4000, 10000, 20000]
 const CONTROL_TIMEOUT_MS = 10000
-const ACTIONS = new Set(['toggle', 'play', 'pause', 'next', 'previous'])
+const ACTIONS = new Set(['toggle', 'play', 'pause', 'next', 'previous', 'seek'])
 const ART_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const ART_NEGATIVE_TTL_MS = 60 * 60 * 1000
 const ART_CACHE_LIMIT = 80
@@ -684,7 +684,7 @@ class MusicHub {
   }
 
   /** Run one control command against a session that is currently present. */
-  async control(id, appId, action) {
+  async control(id, appId, action, positionMs) {
     if (this.unsupported) return { ok: false, error: 'unsupported' }
     if (typeof id !== 'string' || id === '' || id.length > 240) {
       return { ok: false, error: 'invalid-target' }
@@ -693,19 +693,24 @@ class MusicHub {
       return { ok: false, error: 'invalid-target' }
     }
     if (!ACTIONS.has(action)) return { ok: false, error: 'invalid-action' }
+    let seek = 0
+    if (action === 'seek') {
+      if (!Number.isFinite(positionMs)) return { ok: false, error: 'invalid-position' }
+      seek = Math.max(0, Math.min(86_400_000, Math.round(positionMs)))
+    }
     const session = this.snapshot.sessions.find(item => item.id === id && item.appId === appId)
     if (session === undefined) return { ok: false, error: 'not-found' }
     if (this.pendingActions.has(id)) return { ok: false, error: 'busy' }
     this.pendingActions.add(id)
     try {
-      return await this.runControlScript(appId, action, occurrenceOf(id))
+      return await this.runControlScript(appId, action, occurrenceOf(id), seek)
     } finally {
       this.pendingActions.delete(id)
     }
   }
 
   /** Spawn the one-shot control script and parse its answer. */
-  runControlScript(appId, action, occurrence) {
+  runControlScript(appId, action, occurrence, positionMs = 0) {
     return new Promise(resolve => {
       let child
       try {
@@ -724,6 +729,8 @@ class MusicHub {
             action,
             '-Index',
             String(occurrence),
+            '-PositionMs',
+            String(positionMs),
           ],
           { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
         )
@@ -911,7 +918,8 @@ export function apply(ctx) {
     const id = typeof body?.id === 'string' ? body.id : ''
     const appId = typeof body?.appId === 'string' ? body.appId : ''
     const action = typeof body?.action === 'string' ? body.action : ''
-    return jsonResponse(200, await hub.control(id, appId, action))
+    const positionMs = typeof body?.positionMs === 'number' ? body.positionMs : undefined
+    return jsonResponse(200, await hub.control(id, appId, action, positionMs))
   })
 
   register('/api/dsh-music/volume', ['GET', 'POST'], async request => {
