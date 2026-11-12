@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.3 — 2026-11-13
+
+- Equalizer now animates at 60 fps with requestAnimationFrame instead of
+  re-rendering in 20 Hz steps, removing the choppy, fragment-like motion.
+- Bars are interpolated across the FFT spectrum; the random per-bar multipliers
+  are gone, so the shape follows the actual low-to-high frequency content.
+- Full-height bars and fast attack/release remain.
+
 ## 1.2.2 — 2026-11-13
 
 - Equalizer now spans the full widget height: quiet bands fall to almost

@@ -686,30 +686,65 @@ window.__ModuleLoader__.load({
 
     /** Audio-reactive equalizer bars behind the expanded widget. */
     function BackgroundEq(props) {
-      const level = React.useSyncExternalStore(props.music.subscribeLevel, props.music.getLevel)
-      const bands = props.music.getBands()
-      const history = React.useRef([])
+      const barsRef = React.useRef([])
+      const targetsRef = React.useRef(new Array(28).fill(2))
+      const displayRef = React.useRef(new Array(28).fill(2))
       const bars = []
       for (let index = 0; index < 28; index += 1) {
-        const band = bands.length > 0 ? bands[Math.floor((index * bands.length) / 28)] : 0
-        const source = band > 0.02 ? band : level
-        const shaped = Math.min(1, Math.pow(Math.max(0, Math.min(1, source)), 1.05) * 1.35)
-        const factor = 0.75 + ((index * 13) % 25) / 100
-        const target = props.playing ? 2 + shaped * 94 * factor : 2
-        const previous = history.current[index] ?? 2
-        const next = target >= previous ? target : previous + (target - previous) * 0.72
-        history.current[index] = next
         bars.push(
           h('span', {
             key: index,
             className: 'mb-bgEqBar',
-            style: { height: `${Math.max(2, Math.min(98, Math.round(next)))}%` },
+            ref: element => {
+              barsRef.current[index] = element
+            },
           }),
         )
       }
+
+      React.useEffect(() => {
+        const computeTargets = () => {
+          const bands = props.music.getBands()
+          const level = props.music.getLevel()
+          for (let index = 0; index < 28; index += 1) {
+            let value = level
+            if (bands.length > 1) {
+              const position = ((index + 0.5) * bands.length) / 28 - 0.5
+              const lower = Math.max(0, Math.min(bands.length - 1, Math.floor(position)))
+              const upper = Math.max(0, Math.min(bands.length - 1, lower + 1))
+              const fraction = Math.max(0, Math.min(1, position - lower))
+              value = bands[lower] * (1 - fraction) + bands[upper] * fraction
+            }
+            const shaped = Math.min(1, Math.pow(Math.max(0, Math.min(1, value)), 0.9) * 1.35)
+            targetsRef.current[index] = props.playing ? 2 + shaped * 94 : 2
+          }
+        }
+
+        computeTargets()
+        const unsubscribe = props.music.subscribeLevel(computeTargets)
+        let frame
+        const animate = () => {
+          for (let index = 0; index < 28; index += 1) {
+            const element = barsRef.current[index]
+            if (element === null || element === undefined) continue
+            const target = targetsRef.current[index] ?? 2
+            const current = displayRef.current[index] ?? 2
+            const next = current + (target - current) * (target >= current ? 0.55 : 0.22)
+            displayRef.current[index] = next
+            element.style.height = `${Math.max(2, Math.min(98, next)).toFixed(2)}%`
+          }
+          frame = requestAnimationFrame(animate)
+        }
+        frame = requestAnimationFrame(animate)
+        return () => {
+          unsubscribe()
+          cancelAnimationFrame(frame)
+        }
+      }, [props.music, props.playing])
+
       return h(
         'div',
-        { className: 'mb-bgEq', 'data-playing': props.playing ? 'true' : 'false', 'data-level': level.toFixed(3), 'aria-hidden': 'true' },
+        { className: 'mb-bgEq', 'data-playing': props.playing ? 'true' : 'false', 'aria-hidden': 'true' },
         bars,
       )
     }
@@ -1317,7 +1352,7 @@ window.__ModuleLoader__.load({
 .mb-collapse:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-collapse .mb-chevronIcon{transform:rotate(90deg);}
 .mb-bgEq{position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:space-between;gap:3px;padding:0 6px 4px;pointer-events:none;opacity:.17;color:var(--mb-color);z-index:0;overflow:hidden;filter:drop-shadow(0 0 5px color-mix(in srgb,var(--mb-color) 32%,transparent));}
-.mb-bgEqBar{flex:1 1 0;min-width:2px;max-width:4px;border-radius:3px 3px 0 0;background:currentColor;transition:height .04s linear;}
+.mb-bgEqBar{flex:1 1 0;min-width:2px;max-width:4px;height:2%;border-radius:3px 3px 0 0;background:currentColor;transition:none;will-change:height;}
 .mb-bgEq[data-playing="false"] .mb-bgEqBar{animation-play-state:paused;opacity:.45;}
 @keyframes mb-bg-eq{0%{transform:scaleY(.22)}70%{transform:scaleY(1)}100%{transform:scaleY(.62)}}
 .mb-headControls{display:inline-flex;align-items:center;gap:1px;flex:none;}
