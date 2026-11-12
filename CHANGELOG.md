@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.5 — 2026-11-13
+
+- Quiet passages now fall almost to the bottom: the shared floor is reduced,
+  low-level bands are gated, and the height curve is steeper.
+- Left and right halves still rise together on loud material.
+- Reduced the extra high-band gain so loud sections no longer look over-inflated.
+
 ## 1.2.4 — 2026-11-13
 
 - High-frequency bars are lifted: FFT display range capped at 8 kHz, +1 dB per

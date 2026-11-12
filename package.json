@@ -1,6 +1,6 @@
 {
   "name": "@local/music-board",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "private": true,
   "description": "Left-sidebar music widget: all Windows media sources in a now-playing card with cover art, per-app volume, seek, audio-reactive equalizer, and a collapsible strip. Cover art uses Apple iTunes, Deezer and MusicBrainz/Cover Art Archive with generated fallback.",
   "license": "MIT",

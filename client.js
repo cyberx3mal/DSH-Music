@@ -707,16 +707,17 @@ window.__ModuleLoader__.load({
           const bands = props.music.getBands()
           const level = props.music.getLevel()
           const normalized = []
-          const floor = Math.min(1, level * 0.35)
+          const floor = Math.min(1, level * 0.08)
+          const silent = level < 0.03
           if (bands.length > 1) {
             for (let band = 0; band < bands.length; band += 1) {
               const raw = Math.max(0, Math.min(1, bands[band]))
-              const highGain = 1 + (band / Math.max(1, bands.length - 1)) * 0.9
-              const spectrum = raw < 0.015 ? 0 : Math.min(1, raw * highGain)
-              normalized[band] = Math.max(spectrum, floor)
+              const highGain = 1 + (band / Math.max(1, bands.length - 1)) * 0.45
+              const spectrum = raw < 0.03 ? 0 : Math.min(1, raw * highGain)
+              normalized[band] = silent ? 0 : Math.max(spectrum, floor)
             }
           } else {
-            normalized[0] = level
+            normalized[0] = silent ? 0 : level
           }
           for (let index = 0; index < 28; index += 1) {
             let value = normalized[0] ?? level
@@ -727,7 +728,7 @@ window.__ModuleLoader__.load({
               const fraction = Math.max(0, Math.min(1, position - lower))
               value = normalized[lower] * (1 - fraction) + normalized[upper] * fraction
             }
-            const shaped = Math.min(1, Math.pow(Math.max(0, Math.min(1, value)), 0.8) * 1.05)
+            const shaped = Math.pow(Math.max(0, Math.min(1, (value - 0.04) / 0.96)), 1.15)
             targetsRef.current[index] = props.playing ? 2 + shaped * 94 : 2
           }
         }
