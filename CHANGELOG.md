@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 — 2026-11-13
+
+- Equalizer is more responsive: 20 Hz level updates, stronger amplitude mapping,
+  per-bar attack/decay, larger bars, higher contrast and a subtle glow.
+- Refreshed preview for the plugin index.
+
 ## 1.2.0 — 2026-11-13
 
 - Persistent audio/transport helper: app volume, system fallback, transport
