@@ -369,6 +369,105 @@ window.__ModuleLoader__.load({
       return now
     }
 
+    /** Convert an RGB triplet to HSL. */
+    function rgbToHsl(red, green, blue) {
+      const r = red / 255
+      const g = green / 255
+      const b = blue / 255
+      const max = Math.max(r, g, b)
+      const min = Math.min(r, g, b)
+      const lightness = (max + min) / 2
+      if (max === min) return { h: 0, s: 0, l: lightness }
+      const delta = max - min
+      const saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min)
+      let hue
+      if (max === r) hue = ((g - b) / delta + (g < b ? 6 : 0)) / 6
+      else if (max === g) hue = ((b - r) / delta + 2) / 6
+      else hue = ((r - g) / delta + 4) / 6
+      return { h: hue * 360, s: saturation, l: lightness }
+    }
+
+    /**
+     * Extract a usable accent from an album cover. The result is kept in a
+     * middle-lightness range so the widget background and buttons stay legible
+     * in both themes.
+     * @param image - loaded cover image.
+     * @returns a CSS HSL color, or undefined for a grayscale cover.
+     */
+    function accentFromImage(image) {
+      try {
+        if (typeof document === 'undefined') return undefined
+        const size = 32
+        const canvas = document.createElement('canvas')
+        canvas.width = size
+        canvas.height = size
+        const context = canvas.getContext('2d', { willReadFrequently: true })
+        if (context === null) return undefined
+        context.drawImage(image, 0, 0, size, size)
+        const pixels = context.getImageData(0, 0, size, size).data
+        const buckets = new Map()
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (pixels[index + 3] < 160) continue
+          const red = pixels[index]
+          const green = pixels[index + 1]
+          const blue = pixels[index + 2]
+          const hsl = rgbToHsl(red, green, blue)
+          if (hsl.l < 0.12 || hsl.l > 0.9 || hsl.s < 0.16) continue
+          const key = Math.floor(hsl.h / 30) % 12
+          const weight = hsl.s * (1 - Math.abs(hsl.l - 0.55))
+          const bucket = buckets.get(key) ?? { red: 0, green: 0, blue: 0, weight: 0 }
+          bucket.red += red * weight
+          bucket.green += green * weight
+          bucket.blue += blue * weight
+          bucket.weight += weight
+          buckets.set(key, bucket)
+        }
+        let best
+        for (const bucket of buckets.values()) {
+          if (best === undefined || bucket.weight > best.weight) best = bucket
+        }
+        if (best === undefined || best.weight <= 0) return undefined
+        const average = rgbToHsl(best.red / best.weight, best.green / best.weight, best.blue / best.weight)
+        if (average.s < 0.12) return undefined
+        const saturation = Math.max(0.42, Math.min(0.85, average.s))
+        const lightness = Math.max(0.45, Math.min(0.62, average.l))
+        return `hsl(${Math.round(average.h)}, ${Math.round(saturation * 100)}%, ${Math.round(lightness * 100)}%)`
+      } catch {
+        return undefined
+      }
+    }
+
+    /**
+     * Derive the widget accent from the current cover art.
+     * @param art - data URL, or an empty string.
+     * @returns the accent color, or undefined.
+     */
+    function useCoverAccent(art) {
+      const [accent, setAccent] = React.useState(null)
+      React.useEffect(() => {
+        if (typeof art !== 'string' || art === '' || typeof Image === 'undefined') {
+          setAccent(null)
+          return undefined
+        }
+        let cancelled = false
+        const image = new Image()
+        image.onload = () => {
+          if (cancelled) return
+          setAccent(accentFromImage(image) ?? null)
+        }
+        image.onerror = () => {
+          if (!cancelled) setAccent(null)
+        }
+        image.src = art
+        return () => {
+          cancelled = true
+          image.onload = null
+          image.onerror = null
+        }
+      }, [art])
+      return accent
+    }
+
     /**
      * Subscribe a component to a store snapshot.
      * @param store - store with `subscribe` and `getSnapshot`.
@@ -471,21 +570,26 @@ window.__ModuleLoader__.load({
     }
 
     /** Barely visible equalizer bars behind the expanded widget. */
-    function BackgroundEq() {
+    function BackgroundEq(props) {
       const bars = []
-      for (let index = 0; index < 18; index += 1) {
+      for (let index = 0; index < 28; index += 1) {
         bars.push(
           h('span', {
             key: index,
             className: 'mb-bgEqBar',
             style: {
-              height: `${9 + ((index * 37) % 27)}px`,
-              animationDelay: `${(index % 7) * 0.35}s`,
+              height: `${10 + ((index * 29) % 36)}px`,
+              animationDelay: `${((index % 9) * 0.062).toFixed(3)}s`,
+              animationDuration: `${(0.42 + ((index * 7) % 20) / 100).toFixed(2)}s`,
             },
           }),
         )
       }
-      return h('div', { className: 'mb-bgEq', 'aria-hidden': 'true' }, bars)
+      return h(
+        'div',
+        { className: 'mb-bgEq', 'data-playing': props.playing ? 'true' : 'false', 'aria-hidden': 'true' },
+        bars,
+      )
     }
 
     /* ------------------------------------------------------------------ *
@@ -511,6 +615,7 @@ window.__ModuleLoader__.load({
       const others = primary === undefined ? [] : view.rows.filter(session => session.id !== primary.id)
       const anyPlaying = !collapsed && view.rows.some(session => session.status === 'playing')
       const now = useNow(anyPlaying)
+      const accent = useCoverAccent(primary?.art)
 
       React.useEffect(
         () => () => {
@@ -782,9 +887,10 @@ window.__ModuleLoader__.load({
           'data-collapsed': collapsed ? 'true' : 'false',
           'data-tone': primary === undefined ? '0' : String(coverTone(primary)),
           'data-single': others.length === 0 ? 'true' : 'false',
+          style: accent === null ? undefined : { '--mb-accent': accent },
         },
         h(StyleSheet),
-        collapsed ? null : h(BackgroundEq),
+        collapsed ? null : h(BackgroundEq, { playing: primary !== undefined && primary.status === 'playing' }),
         collapsed
           ? h(
               'div',
@@ -846,33 +952,34 @@ window.__ModuleLoader__.load({
      * ------------------------------------------------------------------ */
 
     const CSS = `
-.mb-foot{box-sizing:border-box;width:100%;padding:6px 6px 5px;border:.5px solid var(--dsw-alias-border-l1);border-radius:10px;background:linear-gradient(180deg,color-mix(in srgb,var(--dsw-alias-bg-layer-1) 94%,var(--dsw-alias-brand-primary)) 0%,var(--dsw-alias-bg-layer-1) 46%);display:flex;flex-direction:column;gap:2px;margin-bottom:2px;flex:none;position:relative;overflow:hidden;}
-.mb-foot:not([data-collapsed='true'])[data-tone='0']{--mb-tone:var(--dsw-alias-brand-primary);background:linear-gradient(165deg,color-mix(in srgb,var(--dsw-alias-brand-primary) 13%,var(--dsw-alias-bg-layer-1)),var(--dsw-alias-bg-layer-1) 54%);border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 28%,var(--dsw-alias-border-l1));}
-.mb-foot:not([data-collapsed='true'])[data-tone='1']{--mb-tone:var(--dsw-alias-state-success-primary);background:linear-gradient(165deg,color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,var(--dsw-alias-bg-layer-1)),var(--dsw-alias-bg-layer-1) 54%);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 28%,var(--dsw-alias-border-l1));}
-.mb-foot:not([data-collapsed='true'])[data-tone='2']{--mb-tone:var(--dsw-alias-state-warn-primary);background:linear-gradient(165deg,color-mix(in srgb,var(--dsw-alias-state-warn-primary) 12%,var(--dsw-alias-bg-layer-1)),var(--dsw-alias-bg-layer-1) 54%);border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 28%,var(--dsw-alias-border-l1));}
-.mb-foot:not([data-collapsed='true'])[data-tone='3']{--mb-tone:var(--dsw-alias-brand-primary);background:linear-gradient(165deg,color-mix(in srgb,var(--dsw-alias-brand-primary) 9%,var(--dsw-alias-bg-layer-1)),color-mix(in srgb,var(--dsw-alias-state-warn-primary) 5%,var(--dsw-alias-bg-layer-1)) 54%);border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 24%,var(--dsw-alias-border-l1));}
+.mb-foot{--mb-color:var(--mb-accent,var(--mb-tone,var(--dsw-alias-brand-primary)));box-sizing:border-box;width:100%;padding:6px 6px 5px;border:.5px solid color-mix(in srgb,var(--mb-color) 28%,var(--dsw-alias-border-l1));border-radius:10px;background:linear-gradient(180deg,color-mix(in srgb,var(--mb-color) 11%,var(--dsw-alias-bg-layer-1)) 0%,var(--dsw-alias-bg-layer-1) 54%);display:flex;flex-direction:column;gap:2px;margin-bottom:2px;flex:none;position:relative;overflow:hidden;}
+.mb-foot[data-tone='0']{--mb-tone:var(--dsw-alias-brand-primary);}
+.mb-foot[data-tone='1']{--mb-tone:var(--dsw-alias-state-success-primary);}
+.mb-foot[data-tone='2']{--mb-tone:var(--dsw-alias-state-warn-primary);}
+.mb-foot[data-tone='3']{--mb-tone:var(--dsw-alias-brand-primary);}
 .mb-foot[data-collapsed='true']{height:31px;min-height:31px;padding:4px 5px 3px;justify-content:center;}
 .mb-head{display:flex;align-items:center;gap:4px;padding:0 2px;min-width:0;position:relative;z-index:1;}
 .mb-foot[data-collapsed='true'] .mb-head{padding:0 2px;min-height:22px;}
 .mb-expand{display:flex;align-items:center;gap:4px;flex:1;min-width:0;border:0;background:transparent;color:inherit;font:inherit;text-align:left;padding:1px 2px;border-radius:6px;cursor:pointer;}
-@media (hover:hover){.mb-expand:hover{background:var(--dsw-alias-interactive-bg-hover);}}
+@media (hover:hover){.mb-expand:hover{background:color-mix(in srgb,var(--mb-color) 10%,transparent);}}
 .mb-expand:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-headArtist{flex:0 1 auto;min-width:0;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;color:var(--dsw-alias-label-secondary);}
 .mb-headSep{flex:none;font-size:10px;line-height:16px;color:var(--dsw-alias-label-tertiary);}
 .mb-headTitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;line-height:16px;font-weight:500;color:var(--dsw-alias-label-primary);}
 .mb-collapse{position:absolute;top:5px;right:5px;z-index:3;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
-@media (hover:hover){.mb-collapse:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);}}
+@media (hover:hover){.mb-collapse:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-collapse:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
-.mb-collapse .mb-chevronIcon{transform:rotate(-90deg);}
-.mb-bgEq{position:absolute;left:0;right:0;bottom:0;height:64px;display:flex;align-items:flex-end;justify-content:space-between;gap:3px;padding:0 6px 4px;pointer-events:none;opacity:.055;color:var(--dsw-alias-brand-primary);z-index:0;overflow:hidden;}
-.mb-bgEqBar{flex:1 1 0;min-width:2px;max-width:4px;border-radius:3px 3px 0 0;background:currentColor;transform-origin:bottom;animation:mb-bg-eq 3.8s ease-in-out infinite alternate;}
-@keyframes mb-bg-eq{0%{transform:scaleY(.45)}100%{transform:scaleY(1)}}
+.mb-collapse .mb-chevronIcon{transform:rotate(90deg);}
+.mb-bgEq{position:absolute;left:0;right:0;bottom:0;height:70px;display:flex;align-items:flex-end;justify-content:space-between;gap:3px;padding:0 6px 4px;pointer-events:none;opacity:.1;color:var(--mb-color);z-index:0;overflow:hidden;}
+.mb-bgEqBar{flex:1 1 0;min-width:2px;max-width:4px;border-radius:3px 3px 0 0;background:currentColor;transform-origin:bottom;animation:mb-bg-eq .5s ease-in-out infinite alternate;}
+.mb-bgEq[data-playing="false"] .mb-bgEqBar{animation-play-state:paused;opacity:.45;}
+@keyframes mb-bg-eq{0%{transform:scaleY(.22)}70%{transform:scaleY(1)}100%{transform:scaleY(.62)}}
 .mb-headControls{display:inline-flex;align-items:center;gap:1px;flex:none;}
 .mb-headButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:20px;height:22px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);padding:0;cursor:pointer;}
-@media (hover:hover){.mb-headButton:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);}}
+@media (hover:hover){.mb-headButton:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-headButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-headButton:disabled{cursor:default;opacity:.45;background:transparent;}
-.mb-headPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:0;border-radius:999px;background:linear-gradient(135deg,var(--dsw-alias-brand-primary),color-mix(in srgb,var(--dsw-alias-brand-primary) 45%,var(--dsw-alias-state-success-primary)));color:var(--dsw-alias-bg-base);padding:0;cursor:pointer;box-shadow:0 1px 4px color-mix(in srgb,var(--dsw-alias-brand-primary) 28%,transparent);}
+.mb-headPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:0;border-radius:999px;background:linear-gradient(135deg,var(--mb-color),color-mix(in srgb,var(--mb-color) 55%,var(--dsw-alias-brand-primary)));color:var(--dsw-alias-label-primary);padding:0;cursor:pointer;box-shadow:0 1px 4px color-mix(in srgb,var(--mb-color) 32%,transparent);}
 @media (hover:hover){.mb-headPlay:hover{filter:brightness(1.08);}}
 .mb-headPlay:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-headPlay:disabled{cursor:default;opacity:.45;box-shadow:none;}
@@ -882,10 +989,10 @@ window.__ModuleLoader__.load({
 .mb-list{position:relative;z-index:1;display:flex;flex-direction:column;gap:1px;max-height:min(46vh,380px);overflow:auto;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);padding-bottom:1px;}
 .mb-foot[data-single='true'] .mb-list{max-height:none;overflow:visible;}
 .mb-hero{position:relative;display:flex;flex-direction:column;padding:2px 2px 1px;margin:0;border:0;background:transparent;box-shadow:none;overflow:visible;}
-.mb-hero::before{content:'';position:absolute;top:-28px;left:-18px;width:150px;height:130px;border-radius:999px;background:radial-gradient(circle,color-mix(in srgb,var(--mb-tone,var(--dsw-alias-brand-primary)) 22%,transparent),transparent 70%);pointer-events:none;}
+.mb-hero::before{content:'';position:absolute;top:-28px;left:-18px;width:150px;height:130px;border-radius:999px;background:radial-gradient(circle,color-mix(in srgb,var(--mb-color,var(--dsw-alias-brand-primary)) 22%,transparent),transparent 70%);pointer-events:none;}
 .mb-heroTop{position:relative;z-index:1;display:flex;align-items:center;gap:11px;min-width:0;padding-right:24px;}
 .mb-cover{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none;border-radius:9px;color:var(--dsw-alias-label-primary);overflow:hidden;}
-.mb-coverHero{width:56px;height:56px;border-radius:13px;box-shadow:0 6px 18px color-mix(in srgb,var(--mb-tone,var(--dsw-alias-brand-primary)) 20%,transparent),inset 0 0 0 .5px color-mix(in srgb,var(--dsw-alias-label-primary) 14%,transparent);}
+.mb-coverHero{width:56px;height:56px;border-radius:13px;box-shadow:0 6px 18px color-mix(in srgb,var(--mb-color,var(--dsw-alias-brand-primary)) 26%,transparent),inset 0 0 0 .5px color-mix(in srgb,var(--dsw-alias-label-primary) 14%,transparent);}
 .mb-coverSmall{width:30px;height:30px;border-radius:8px;}
 .mb-cover[data-tone='0']{background:linear-gradient(135deg,var(--dsw-alias-brand-primary),color-mix(in srgb,var(--dsw-alias-brand-primary) 50%,var(--dsw-alias-state-success-primary)));}
 .mb-cover[data-tone='1']{background:linear-gradient(135deg,var(--dsw-alias-state-success-primary),color-mix(in srgb,var(--dsw-alias-state-success-primary) 55%,var(--dsw-alias-brand-primary)));}
@@ -910,20 +1017,20 @@ window.__ModuleLoader__.load({
 .mb-time{font-size:10px;line-height:12px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;flex:none;min-width:25px;}
 .mb-time:last-child{text-align:right;}
 .mb-progress{flex:1;height:4px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);overflow:hidden;}
-.mb-progressFill{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--dsw-alias-brand-primary),color-mix(in srgb,var(--dsw-alias-brand-primary) 45%,var(--dsw-alias-state-success-primary)));transition:width .45s linear;}
+.mb-progressFill{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--mb-color),color-mix(in srgb,var(--mb-color) 45%,var(--dsw-alias-state-success-primary)));transition:width .45s linear;}
 .mb-heroControls{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px;padding:0 4px;}
 .mb-transportButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);padding:0;cursor:pointer;}
-@media (hover:hover){.mb-transportButton:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);}}
+@media (hover:hover){.mb-transportButton:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-transportButton:active{background:var(--dsw-alias-interactive-bg-active);}
 .mb-transportButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-transportButton:disabled{cursor:default;opacity:.45;background:transparent;}
-.mb-playButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:999px;background:linear-gradient(135deg,var(--dsw-alias-brand-primary),color-mix(in srgb,var(--dsw-alias-brand-primary) 45%,var(--dsw-alias-state-success-primary)));color:var(--dsw-alias-bg-base);padding:0;cursor:pointer;box-shadow:0 2px 8px color-mix(in srgb,var(--mb-tone,var(--dsw-alias-brand-primary)) 28%,transparent);}
+.mb-playButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:999px;background:linear-gradient(135deg,var(--mb-color),color-mix(in srgb,var(--mb-color) 55%,var(--dsw-alias-brand-primary)));color:var(--dsw-alias-label-primary);padding:0;cursor:pointer;box-shadow:0 2px 8px color-mix(in srgb,var(--mb-color) 34%,transparent);}
 .mb-playButtonHero{width:34px;height:34px;}
 @media (hover:hover){.mb-playButton:hover{filter:brightness(1.08);}}
 .mb-playButton:active{transform:scale(.97);}
 .mb-playButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px;}
 .mb-playButton:disabled{cursor:default;opacity:.45;box-shadow:none;transform:none;}
-.mb-sectionLabel{padding:9px 3px 3px;font-size:8.5px;line-height:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--dsw-alias-label-tertiary);border-top:.5px solid color-mix(in srgb,var(--mb-tone,var(--dsw-alias-border-l2)) 28%,var(--dsw-alias-border-l2));margin-top:6px;}
+.mb-sectionLabel{padding:9px 3px 3px;font-size:8.5px;line-height:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--dsw-alias-label-tertiary);border-top:.5px solid color-mix(in srgb,var(--mb-color,var(--dsw-alias-border-l2)) 32%,var(--dsw-alias-border-l2));margin-top:6px;}
 .mb-other{display:flex;align-items:center;gap:2px;border-radius:8px;min-width:0;}
 @media (hover:hover){.mb-other:hover{background:var(--dsw-alias-interactive-bg-hover);}}
 .mb-otherMain{display:flex;align-items:center;gap:7px;flex:1;min-width:0;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;padding:3px 2px;cursor:pointer;}
@@ -931,8 +1038,8 @@ window.__ModuleLoader__.load({
 .mb-otherText{display:flex;flex-direction:column;gap:0;min-width:0;flex:1;}
 .mb-otherTitle{font-size:11.5px;line-height:15px;font-weight:500;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .mb-otherApp{font-size:9.5px;line-height:12px;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.mb-otherPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:0;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 11%,transparent);color:var(--dsw-alias-brand-primary);padding:0;cursor:pointer;}
-@media (hover:hover){.mb-otherPlay:hover{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 20%,transparent);}}
+.mb-otherPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:0;border-radius:999px;background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--mb-color);padding:0;cursor:pointer;}
+@media (hover:hover){.mb-otherPlay:hover{background:color-mix(in srgb,var(--mb-color) 24%,transparent);}}
 .mb-otherPlay:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-otherPlay:disabled{cursor:default;opacity:.45;background:transparent;}
 .mb-other[data-pending='true']{opacity:.7;}
