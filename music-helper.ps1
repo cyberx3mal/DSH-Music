@@ -228,7 +228,7 @@ public static class MusicLoopback
         {
             for (int i = 0; i < BandCount; i++)
             {
-                bands[i] = Math.Max(next[i], bands[i] * 0.82f);
+                bands[i] = Math.Max(next[i], bands[i] * 0.6f);
             }
         }
     }

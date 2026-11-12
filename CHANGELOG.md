@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2 — 2026-11-13
+
+- Equalizer now spans the full widget height: quiet bands fall to almost
+  nothing, loud bands jump instantly and reach close to the top.
+- Instant attack, fast decay and faster FFT band release for real rises/falls.
+
 ## 1.2.1 — 2026-11-13
 
 - Equalizer is more responsive: 20 Hz level updates, stronger amplitude mapping,
