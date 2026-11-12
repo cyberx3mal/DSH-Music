@@ -617,7 +617,7 @@ public static class MusicLevelPump
                     MusicOutput.WriteLine("{\"type\":\"level\",\"value\":" + level.ToString("0.###", invariant) + ",\"bands\":[" + bandText + "]}");
                 }
                 catch { }
-                Thread.Sleep(80);
+                Thread.Sleep(50);
             }
         });
         thread.IsBackground = true;
