@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.4 — 2026-11-13
+
+- High-frequency bars are lifted: FFT display range capped at 8 kHz, +1 dB per
+  band tilt and a high-band display gain. Left and right halves now rise at
+  similar heights instead of the right side staying low.
+- A shared level floor keeps bars readable during loud sections while they still
+  fall when the music gets quiet.
+
 ## 1.2.3 — 2026-11-13
 
 - Equalizer now animates at 60 fps with requestAnimationFrame instead of

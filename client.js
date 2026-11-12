@@ -706,16 +706,28 @@ window.__ModuleLoader__.load({
         const computeTargets = () => {
           const bands = props.music.getBands()
           const level = props.music.getLevel()
-          for (let index = 0; index < 28; index += 1) {
-            let value = level
-            if (bands.length > 1) {
-              const position = ((index + 0.5) * bands.length) / 28 - 0.5
-              const lower = Math.max(0, Math.min(bands.length - 1, Math.floor(position)))
-              const upper = Math.max(0, Math.min(bands.length - 1, lower + 1))
-              const fraction = Math.max(0, Math.min(1, position - lower))
-              value = bands[lower] * (1 - fraction) + bands[upper] * fraction
+          const normalized = []
+          const floor = Math.min(1, level * 0.35)
+          if (bands.length > 1) {
+            for (let band = 0; band < bands.length; band += 1) {
+              const raw = Math.max(0, Math.min(1, bands[band]))
+              const highGain = 1 + (band / Math.max(1, bands.length - 1)) * 0.9
+              const spectrum = raw < 0.015 ? 0 : Math.min(1, raw * highGain)
+              normalized[band] = Math.max(spectrum, floor)
             }
-            const shaped = Math.min(1, Math.pow(Math.max(0, Math.min(1, value)), 0.9) * 1.35)
+          } else {
+            normalized[0] = level
+          }
+          for (let index = 0; index < 28; index += 1) {
+            let value = normalized[0] ?? level
+            if (normalized.length > 1) {
+              const position = ((index + 0.5) * normalized.length) / 28 - 0.5
+              const lower = Math.max(0, Math.min(normalized.length - 1, Math.floor(position)))
+              const upper = Math.max(0, Math.min(normalized.length - 1, lower + 1))
+              const fraction = Math.max(0, Math.min(1, position - lower))
+              value = normalized[lower] * (1 - fraction) + normalized[upper] * fraction
+            }
+            const shaped = Math.min(1, Math.pow(Math.max(0, Math.min(1, value)), 0.8) * 1.05)
             targetsRef.current[index] = props.playing ? 2 + shaped * 94 : 2
           }
         }

@@ -204,7 +204,7 @@ public static class MusicLoopback
 
         float[] next = new float[BandCount];
         double minFrequency = 40.0;
-        double maxFrequency = Math.Min(14000.0, sampleRate / 2.0);
+        double maxFrequency = Math.Min(8000.0, sampleRate / 2.0);
         for (int band = 0; band < BandCount; band++)
         {
             double from = minFrequency * Math.Pow(maxFrequency / minFrequency, (double)band / BandCount);
@@ -220,7 +220,7 @@ public static class MusicLoopback
                 count++;
             }
             double magnitude = Math.Sqrt(sum / Math.Max(1, count)) / FftSize;
-            double db = 20.0 * Math.Log10(magnitude + 1e-9);
+            double db = 20.0 * Math.Log10(magnitude + 1e-9) + band * 1.0;
             next[band] = (float)Math.Max(0.0, Math.Min(1.0, (db + 68.0) / 58.0));
         }
 
