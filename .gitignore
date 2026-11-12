@@ -1,0 +1,7 @@
+debug.log
+.dev/
+.reload*/
+.probe/
+.check*/
+*.bak
+node_modules/

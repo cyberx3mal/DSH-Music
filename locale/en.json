@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Music widget",
+    "description": "Left-sidebar music widget: a now-playing card with cover art for every media source on this PC, play/pause, previous/next, other sources, and a collapsible strip with quick controls. Windows only; cover art is looked up through Apple's iTunes Search API when a track changes and falls back to generated artwork."
+  }
+}

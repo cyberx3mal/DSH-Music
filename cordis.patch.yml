@@ -1,0 +1,3 @@
+- insert:
+    - id: local-music-board
+      name: '@local/music-board'
