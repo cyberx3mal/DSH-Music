@@ -15,6 +15,7 @@ window.__ModuleLoader__.load({
     const NS = 'musicBoard'
     const STREAM_PATH = '/api/dsh-music/stream'
     const ACTION_PATH = '/api/dsh-music/action'
+    const VOLUME_PATH = '/api/dsh-music/volume'
     const COLLAPSE_KEY = 'music-board:collapsed'
     const STATE_RANK = { playing: 0, paused: 1, idle: 2 }
 
@@ -31,6 +32,10 @@ window.__ModuleLoader__.load({
         previous: 'Previous track',
         openSource: 'Open {app} in the player',
         otherSources: 'More sources',
+        volume: 'Volume',
+        systemVolume: 'System volume',
+        mute: 'Mute',
+        unmute: 'Unmute',
         progress: 'Playback position',
         progressValue: '{position} of {duration}',
         actionFailed: 'Could not control the player.',
@@ -50,6 +55,10 @@ window.__ModuleLoader__.load({
         previous: 'Предыдущий трек',
         openSource: 'Открыть {app} в плеере',
         otherSources: 'Другие источники',
+        volume: 'Громкость',
+        systemVolume: 'Системная громкость',
+        mute: 'Выключить звук',
+        unmute: 'Включить звук',
         progress: 'Позиция воспроизведения',
         progressValue: '{position} из {duration}',
         actionFailed: 'Не удалось управлять плеером.',
@@ -232,6 +241,40 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const getVolume = async () => {
+        try {
+          const response = await fetch(VOLUME_PATH, {
+            method: 'GET',
+            credentials: 'same-origin',
+            cache: 'no-store',
+          })
+          if (!response.ok) return { ok: false, error: `HTTP ${response.status}` }
+          const answer = await response.json()
+          return answer !== null && typeof answer === 'object' ? answer : { ok: false, error: 'invalid-answer' }
+        } catch (error) {
+          console.error('[music-board] volume', error)
+          return { ok: false, error: 'transport' }
+        }
+      }
+
+      const setVolume = async (payload) => {
+        try {
+          const response = await fetch(VOLUME_PATH, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            credentials: 'same-origin',
+            cache: 'no-store',
+            body: JSON.stringify(payload),
+          })
+          if (!response.ok) return { ok: false, error: `HTTP ${response.status}` }
+          const answer = await response.json()
+          return answer !== null && typeof answer === 'object' ? answer : { ok: false, error: 'invalid-answer' }
+        } catch (error) {
+          console.error('[music-board] volume', error)
+          return { ok: false, error: 'transport' }
+        }
+      }
+
       return {
         getSnapshot: () => snapshot,
         subscribe(listener) {
@@ -244,6 +287,8 @@ window.__ModuleLoader__.load({
           if (!disposed) void connect()
         },
         action,
+        getVolume,
+        setVolume,
         dispose() {
           disposed = true
           if (retryTimer !== null) {
@@ -558,6 +603,28 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** Speaker glyph, optionally muted. */
+    function VolumeIcon(props) {
+      return h(
+        'svg',
+        { width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', 'aria-hidden': 'true', focusable: 'false' },
+        h('path', { d: 'M2 4.2h2L7 2v8L4 7.8H2z', fill: 'currentColor' }),
+        props.muted
+          ? h('path', {
+              d: 'M8.2 4.2l3.2 3.6M11.4 4.2L8.2 7.8',
+              stroke: 'currentColor',
+              strokeWidth: 1.2,
+              strokeLinecap: 'round',
+            })
+          : h('path', {
+              d: 'M8.6 4.2a2.6 2.6 0 0 1 0 3.6M10.2 2.8a4.6 4.6 0 0 1 0 6.4',
+              stroke: 'currentColor',
+              strokeWidth: 1.1,
+              strokeLinecap: 'round',
+            }),
+      )
+    }
+
     /** Animated equalizer for the cover of a playing source. */
     function EqualizerIcon() {
       return h(
@@ -608,7 +675,10 @@ window.__ModuleLoader__.load({
       const [selectedId, setSelectedId] = React.useState(null)
       const [pending, setPending] = React.useState(() => ({}))
       const [error, setError] = React.useState(null)
+      const [volume, setVolume] = React.useState(null)
+      const [muted, setMuted] = React.useState(false)
       const timers = React.useRef(new Set())
+      const volumeTimer = React.useRef(null)
 
       const view = React.useMemo(() => deriveView(snapshot.sessions), [snapshot])
       const primary = view.rows.find(session => session.id === selectedId) ?? view.primary
@@ -621,9 +691,24 @@ window.__ModuleLoader__.load({
         () => () => {
           for (const timer of timers.current) clearTimeout(timer)
           timers.current.clear()
+          if (volumeTimer.current !== null) clearTimeout(volumeTimer.current)
         },
         [],
       )
+
+      React.useEffect(() => {
+        let cancelled = false
+        void music.getVolume().then(answer => {
+          if (cancelled) return
+          if (answer !== null && answer.ok === true && Number.isFinite(answer.volume)) {
+            setVolume(Math.max(0, Math.min(100, Math.round(answer.volume))))
+            setMuted(answer.muted === true)
+          }
+        })
+        return () => {
+          cancelled = true
+        }
+      }, [music])
 
       React.useEffect(() => {
         if (error === null) return undefined
@@ -677,6 +762,32 @@ window.__ModuleLoader__.load({
       const actionFor = session => (session.status === 'playing' ? 'pause' : 'play')
       const appNameOf = session =>
         session.appKnown === false ? tr('mediaSource') : session.app || tr('mediaSource')
+
+      const applyVolume = next => {
+        const value = Math.max(0, Math.min(100, Math.round(next)))
+        setVolume(value)
+        if (volumeTimer.current !== null) clearTimeout(volumeTimer.current)
+        volumeTimer.current = setTimeout(() => {
+          volumeTimer.current = null
+          void music.setVolume({ volume: value }).then(answer => {
+            if (answer !== null && answer.ok === true) {
+              if (Number.isFinite(answer.volume)) setVolume(Math.max(0, Math.min(100, Math.round(answer.volume))))
+              setMuted(answer.muted === true)
+            }
+          })
+        }, 180)
+      }
+
+      const toggleMute = () => {
+        const next = !muted
+        setMuted(next)
+        void music.setVolume({ muted: next }).then(answer => {
+          if (answer !== null && answer.ok === true) {
+            if (Number.isFinite(answer.volume)) setVolume(Math.max(0, Math.min(100, Math.round(answer.volume))))
+            setMuted(answer.muted === true)
+          }
+        })
+      }
 
       const cover = (session, hero) => {
         const playing = session.status === 'playing'
@@ -837,6 +948,36 @@ window.__ModuleLoader__.load({
               h(SkipIcon, { direction: 'next' }),
             ),
           ),
+          volume !== null
+            ? h(
+                'div',
+                { className: 'mb-volume' },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'mb-volumeButton',
+                    'data-muted': muted ? 'true' : 'false',
+                    'aria-label': muted ? tr('unmute') : tr('mute'),
+                    title: muted ? tr('unmute') : tr('mute'),
+                    onClick: toggleMute,
+                  },
+                  h(VolumeIcon, { muted }),
+                ),
+                h('input', {
+                  type: 'range',
+                  className: 'mb-volumeRange',
+                  min: 0,
+                  max: 100,
+                  step: 1,
+                  value: volume,
+                  'aria-label': tr('volume'),
+                  title: tr('systemVolume'),
+                  onChange: event => applyVolume(Number(event.target.value)),
+                }),
+                h('span', { className: 'mb-volumeValue' }, `${volume}%`),
+              )
+            : null,
         )
       }
 
@@ -1030,6 +1171,16 @@ window.__ModuleLoader__.load({
 .mb-playButton:active{transform:scale(.97);}
 .mb-playButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px;}
 .mb-playButton:disabled{cursor:default;opacity:.45;box-shadow:none;transform:none;}
+.mb-volume{position:relative;z-index:1;display:flex;align-items:center;gap:7px;margin-top:8px;padding:0 4px;}
+.mb-volumeButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
+@media (hover:hover){.mb-volumeButton:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
+.mb-volumeButton[data-muted='true']{color:var(--mb-color);}
+.mb-volumeButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
+.mb-volumeRange{flex:1;min-width:0;height:3px;-webkit-appearance:none;appearance:none;background:color-mix(in srgb,var(--dsw-alias-label-primary) 12%,transparent);border-radius:999px;outline:none;cursor:pointer;}
+.mb-volumeRange::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:10px;height:10px;border-radius:999px;background:var(--mb-color);box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-alias-bg-layer-1) 85%,transparent);}
+.mb-volumeRange::-moz-range-thumb{width:10px;height:10px;border:0;border-radius:999px;background:var(--mb-color);}
+.mb-volumeRange:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:3px;}
+.mb-volumeValue{flex:none;min-width:28px;text-align:right;font-size:9.5px;line-height:12px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;}
 .mb-sectionLabel{padding:9px 3px 3px;font-size:8.5px;line-height:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--dsw-alias-label-tertiary);border-top:.5px solid color-mix(in srgb,var(--mb-color,var(--dsw-alias-border-l2)) 32%,var(--dsw-alias-border-l2));margin-top:6px;}
 .mb-other{display:flex;align-items:center;gap:2px;border-radius:8px;min-width:0;}
 @media (hover:hover){.mb-other:hover{background:var(--dsw-alias-interactive-bg-hover);}}

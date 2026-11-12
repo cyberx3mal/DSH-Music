@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url))
 const WATCHER_SCRIPT = path.join(PACKAGE_DIR, 'smtc-watcher.ps1')
 const CONTROL_SCRIPT = path.join(PACKAGE_DIR, 'smtc-control.ps1')
+const VOLUME_SCRIPT = path.join(PACKAGE_DIR, 'volume.ps1')
 const POWERSHELL = path.join(
   process.env.SystemRoot ?? 'C:\\Windows',
   'System32',
@@ -787,6 +788,86 @@ class MusicHub {
     })
   }
 
+  /**
+   * Read or change the default playback device's master volume.
+   * @param action - `get`, `set`, `mute`, `unmute`, or `toggle`.
+   * @param value - 0–100 for `set`.
+   * @returns the volume state or an error.
+   */
+  runVolumeScript(action, value) {
+    return new Promise(resolve => {
+      let child
+      try {
+        child = spawn(
+          POWERSHELL,
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            VOLUME_SCRIPT,
+            '-Action',
+            action,
+            '-Value',
+            String(value),
+          ],
+          { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+      } catch (error) {
+        resolve({ ok: false, error: 'spawn-failed' })
+        return
+      }
+      let stdout = ''
+      let settled = false
+      const finish = result => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(result)
+      }
+      const timer = setTimeout(() => {
+        try {
+          child.kill()
+        } catch {
+          /* already gone */
+        }
+        finish({ ok: false, error: 'timeout' })
+      }, 8000)
+      if (typeof timer.unref === 'function') timer.unref()
+      child.stdout?.on('data', chunk => {
+        stdout = (stdout + String(chunk)).slice(-16_000)
+      })
+      child.stderr?.on('data', () => {
+        /* the JSON answer is enough; diagnostics stay out of the UI */
+      })
+      child.on('error', () => finish({ ok: false, error: 'spawn-failed' }))
+      child.on('close', () => {
+        const lines = stdout
+          .split(/\r?\n/)
+          .map(line => line.trim())
+          .filter(line => line.startsWith('{'))
+        for (let index = lines.length - 1; index >= 0; index -= 1) {
+          try {
+            const answer = JSON.parse(lines[index])
+            if (answer !== null && typeof answer === 'object') {
+              finish({
+                ok: answer.ok === true,
+                volume: Number.isFinite(answer.volume) ? Math.max(0, Math.min(100, Math.round(answer.volume))) : undefined,
+                muted: answer.muted === true,
+                error: answer.ok === true ? undefined : text(answer.error, 80) || 'volume-failed',
+              })
+              return
+            }
+          } catch {
+            /* keep looking */
+          }
+        }
+        finish({ ok: false, error: 'no-answer' })
+      })
+    })
+  }
+
   /** Stop everything owned by the plugin. */
   dispose() {
     this.disposed = true
@@ -831,6 +912,32 @@ export function apply(ctx) {
     const appId = typeof body?.appId === 'string' ? body.appId : ''
     const action = typeof body?.action === 'string' ? body.action : ''
     return jsonResponse(200, await hub.control(id, appId, action))
+  })
+
+  register('/api/dsh-music/volume', ['GET', 'POST'], async request => {
+    if (request.method === 'GET') return jsonResponse(200, await hub.runVolumeScript('get', 0))
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      return jsonResponse(400, { ok: false, error: 'invalid-body' })
+    }
+    const volume = Number.isFinite(body?.volume)
+      ? Math.max(0, Math.min(100, Math.round(body.volume)))
+      : undefined
+    const muted = typeof body?.muted === 'boolean' ? body.muted : undefined
+    if (volume === undefined && muted === undefined) {
+      return jsonResponse(400, { ok: false, error: 'invalid-volume' })
+    }
+    let result = { ok: true }
+    if (volume !== undefined) {
+      result = await hub.runVolumeScript('set', volume)
+      if (!result.ok) return jsonResponse(200, result)
+    }
+    if (muted !== undefined) {
+      result = await hub.runVolumeScript(muted ? 'mute' : 'unmute', 0)
+    }
+    return jsonResponse(200, result)
   })
 
   register('/api/dsh-music/stream', ['GET'], async request => {
