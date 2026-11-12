@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Music widget",
-    "description": "Left-sidebar music widget: a now-playing card with cover art for every media source on this PC, play/pause, previous/next, system volume and mute, other sources, and a collapsible strip with quick controls. Windows only; cover art is looked up through Apple iTunes, Deezer and MusicBrainz/Cover Art Archive when a track changes and falls back to generated artwork."
+    "description": "Left-sidebar music widget: a now-playing card with cover art for every media source on this PC, play/pause, previous/next, seek, per-app volume with system fallback, an audio-reactive equalizer, and a collapsible strip with quick controls. Windows only; cover art is looked up through Apple iTunes, Deezer and MusicBrainz/Cover Art Archive when a track changes and falls back to generated artwork."
   }
 }

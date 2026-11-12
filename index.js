@@ -14,13 +14,15 @@
  * last one, so an idle page owns no helper process.
  */
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url))
 const WATCHER_SCRIPT = path.join(PACKAGE_DIR, 'smtc-watcher.ps1')
-const CONTROL_SCRIPT = path.join(PACKAGE_DIR, 'smtc-control.ps1')
-const VOLUME_SCRIPT = path.join(PACKAGE_DIR, 'volume.ps1')
+const HELPER_SCRIPT = path.join(PACKAGE_DIR, 'music-helper.ps1')
 const POWERSHELL = path.join(
   process.env.SystemRoot ?? 'C:\\Windows',
   'System32',
@@ -34,13 +36,21 @@ const MAX_TEXT = 400
 const MAX_LINE_BYTES = 512 * 1024
 const IDLE_STOP_MS = 5000
 const RESTART_DELAYS_MS = [500, 1500, 4000, 10000, 20000]
-const CONTROL_TIMEOUT_MS = 10000
 const ACTIONS = new Set(['toggle', 'play', 'pause', 'next', 'previous', 'seek'])
 const ART_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const ART_NEGATIVE_TTL_MS = 60 * 60 * 1000
 const ART_CACHE_LIMIT = 80
 const ART_MAX_BYTES = 160 * 1024
 const ART_FETCH_TIMEOUT_MS = 5000
+const COVER_ART_ENABLED = !/^(0|off|false)$/i.test(process.env.DSH_MUSIC_COVER_ART ?? '')
+const COVER_PROVIDERS = new Set(
+  (process.env.DSH_MUSIC_COVER_PROVIDERS ?? 'apple,deezer,musicbrainz')
+    .toLowerCase()
+    .split(',')
+    .map(name => name.trim())
+    .filter(name => name !== ''),
+)
+const ART_DISK_DIR = path.join(process.env.LOCALAPPDATA ?? os.tmpdir(), 'dsh-music-cache', 'art')
 
 /** Services this half needs; without Connection it stays inactive. */
 export const inject = ['connection']
@@ -124,18 +134,6 @@ function normalizeSession(row, index, seen) {
 /** Last-resort app label when the watcher supplied nothing. */
 function appNameFallback(index) {
   return index === 0 ? 'Media' : `Media ${String(index + 1)}`
-}
-
-/**
- * Resolve the occurrence index encoded in a normalized duplicate id.
- * @param id - session id (`appId` or `appId#n`).
- * @returns the zero-based occurrence among sessions with that appId.
- */
-function occurrenceOf(id) {
-  const at = id.lastIndexOf('#')
-  if (at <= 0) return 0
-  const value = Number(id.slice(at + 1))
-  return Number.isInteger(value) && value >= 2 && value <= MAX_SESSIONS ? value - 1 : 0
 }
 
 /** Stable cache key for a source's current track. */
@@ -406,9 +404,16 @@ class MusicHub {
     this.restartAttempt = 0
     this.unsupported = !IS_WINDOWS
     this.disposed = false
-    this.pendingActions = new Set()
     this.artCache = new Map()
     this.artPending = new Set()
+    this.artSent = new WeakMap()
+    this.helper = null
+    this.helperBuffer = ''
+    this.helperPending = new Map()
+    this.helperSeq = 0
+    this.helperTimer = null
+    this.helperAttempt = 0
+    this.level = 0
   }
 
   /** Publish one snapshot to every open stream. */
@@ -416,12 +421,39 @@ class MusicHub {
     const enriched = this.withArt(snapshot)
     this.snapshot = enriched
     for (const send of [...this.subscribers]) {
+      const seen = this.artSent.get(send) ?? new Map()
+      this.artSent.set(send, seen)
       try {
-        send(enriched)
+        send(this.withVisibleArt(enriched, seen))
       } catch (error) {
         console.error('[music-board] subscriber', error)
       }
     }
+  }
+
+  /** Remove cover data that this subscriber already received. */
+  withVisibleArt(snapshot, seen) {
+    let changed = false
+    const sessions = snapshot.sessions.map(session => {
+      const art = typeof session.art === 'string' ? session.art : ''
+      const previous = seen.get(session.id)
+      seen.set(session.id, art)
+      if (previous === art) {
+        const copy = { ...session }
+        delete copy.art
+        changed = true
+        return copy
+      }
+      return session
+    })
+    return changed ? { ...snapshot, sessions } : snapshot
+  }
+
+  /** Send the current full snapshot to one fresh subscriber. */
+  sendInitial(send) {
+    const seen = this.artSent.get(send) ?? new Map()
+    this.artSent.set(send, seen)
+    send(this.withVisibleArt(this.snapshot, seen))
   }
 
   /**
@@ -455,6 +487,34 @@ class MusicHub {
     return changed ? { ...snapshot, sessions } : snapshot
   }
 
+  /** Path for one cover cache entry. */
+  diskArtPath(key) {
+    return path.join(ART_DISK_DIR, `${createHash('sha1').update(key).digest('hex')}.json`)
+  }
+
+  /** Read a non-expired cover from the disk cache. */
+  async readDiskArt(key) {
+    try {
+      const entry = JSON.parse(await readFile(this.diskArtPath(key), 'utf8'))
+      if (entry === null || typeof entry.art !== 'string' || !Number.isFinite(entry.at)) return undefined
+      const ttl = entry.art === '' ? ART_NEGATIVE_TTL_MS : ART_CACHE_TTL_MS
+      if (Date.now() - entry.at > ttl) return undefined
+      return { art: entry.art, at: entry.at }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Persist a cover result; failures are non-fatal. */
+  async writeDiskArt(key, entry) {
+    try {
+      await mkdir(ART_DISK_DIR, { recursive: true })
+      await writeFile(this.diskArtPath(key), JSON.stringify(entry), 'utf8')
+    } catch {
+      /* the memory cache still works */
+    }
+  }
+
   /**
    * Try Apple, Deezer and MusicBrainz in order and cache the first usable
    * artwork. Track title and artist leave the machine only for these lookups;
@@ -468,12 +528,21 @@ class MusicHub {
         this.artCache.set(key, { art: '', at: Date.now() })
         return
       }
-      const providers = [
-        () => appleArtwork(session, ''),
-        () => appleArtwork(session, 'RU'),
-        () => deezerArtwork(session),
-        () => musicBrainzArtwork(session),
-      ]
+      if (!COVER_ART_ENABLED) {
+        this.artCache.set(key, { art: '', at: Date.now() })
+        return
+      }
+      const disk = await this.readDiskArt(key)
+      if (disk !== undefined) {
+        this.artCache.set(key, disk)
+        return
+      }
+      const providers = []
+      if (COVER_PROVIDERS.has('apple')) {
+        providers.push(() => appleArtwork(session, ''), () => appleArtwork(session, 'RU'))
+      }
+      if (COVER_PROVIDERS.has('deezer')) providers.push(() => deezerArtwork(session))
+      if (COVER_PROVIDERS.has('musicbrainz')) providers.push(() => musicBrainzArtwork(session))
       let art
       for (const provider of providers) {
         if (this.disposed) break
@@ -487,14 +556,12 @@ class MusicHub {
         art = await fetchArtwork(candidate)
         if (art !== undefined) break
       }
-      if (art === undefined) {
-        this.artCache.set(key, { art: '', at: Date.now() })
-      } else {
-        this.artCache.set(key, { art, at: Date.now() })
-        if (this.artCache.size > ART_CACHE_LIMIT) {
-          const oldest = this.artCache.keys().next().value
-          if (oldest !== undefined) this.artCache.delete(oldest)
-        }
+      const entry = { art: art ?? '', at: Date.now() }
+      this.artCache.set(key, entry)
+      await this.writeDiskArt(key, entry)
+      if (this.artCache.size > ART_CACHE_LIMIT) {
+        const oldest = this.artCache.keys().next().value
+        if (oldest !== undefined) this.artCache.delete(oldest)
       }
     } catch {
       this.artCache.set(key, { art: '', at: Date.now() })
@@ -515,6 +582,7 @@ class MusicHub {
     this.unsupported = true
     this.publish(unsupportedSnapshot())
     this.stopWatcher()
+    this.stopHelper()
   }
 
   /** Start the watcher if it is not already running. */
@@ -635,16 +703,190 @@ class MusicHub {
     if (typeof this.restartTimer.unref === 'function') this.restartTimer.unref()
   }
 
+  /** Start the audio/transport helper if it is not already running. */
+  ensureHelper() {
+    if (this.disposed || !IS_WINDOWS || this.helper !== null) return
+    const child = spawn(
+      POWERSHELL,
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', HELPER_SCRIPT],
+      { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
+    )
+    this.helper = child
+    this.helperBuffer = ''
+    child.stdout?.on('data', chunk => this.consumeHelper(String(chunk)))
+    child.stderr?.on('data', chunk => {
+      console.error('[music-board] helper:', text(String(chunk), 500))
+    })
+    child.on('error', error => {
+      console.error('[music-board] helper spawn', error)
+      if (this.helper !== child) return
+      this.helper = null
+      this.handleHelperExit()
+    })
+    child.on('close', () => {
+      if (this.helper !== child) return
+      this.helper = null
+      this.handleHelperExit()
+    })
+  }
+
+  /** Split helper stdout into JSON lines. */
+  consumeHelper(chunk) {
+    this.helperBuffer += chunk
+    if (this.helperBuffer.length > MAX_LINE_BYTES) {
+      this.helperBuffer = this.helperBuffer.slice(-Math.floor(MAX_LINE_BYTES / 2))
+      return
+    }
+    let newline = this.helperBuffer.indexOf('\n')
+    while (newline !== -1) {
+      const line = this.helperBuffer.slice(0, newline).trim()
+      this.helperBuffer = this.helperBuffer.slice(newline + 1)
+      if (line !== '') {
+        try {
+          const message = JSON.parse(line)
+          if (message?.type === 'level') {
+            this.publishLevel(Number(message.value), message.bands)
+          } else if (message?.type === 'response') {
+            const requestId = message.requestId
+            const pending = this.helperPending.get(requestId)
+            if (pending !== undefined) {
+              this.helperPending.delete(requestId)
+              clearTimeout(pending.timer)
+              pending.resolve({
+                ok: message.ok === true,
+                volume: Number.isFinite(message.volume)
+                  ? Math.max(0, Math.min(100, Math.round(message.volume)))
+                  : undefined,
+                muted: message.muted === true,
+                scope: message.scope === 'app' ? 'app' : 'system',
+                error: message.ok === true ? undefined : text(message.error, 80) || 'rejected',
+              })
+            }
+          }
+        } catch {
+          /* ignore malformed helper output */
+        }
+      }
+      newline = this.helperBuffer.indexOf('\n')
+    }
+  }
+
+  /** Broadcast one audio level and its frequency bands to the widgets. */
+  publishLevel(value, bands) {
+    const level = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
+    const nextBands = Array.isArray(bands)
+      ? bands
+          .slice(0, 32)
+          .map(band => (Number.isFinite(band) ? Math.max(0, Math.min(1, band)) : 0))
+      : []
+    this.level = level
+    const message = { type: 'level', value: level, bands: nextBands, at: Date.now() }
+    for (const send of [...this.subscribers]) {
+      try {
+        send(message)
+      } catch (error) {
+        console.error('[music-board] level subscriber', error)
+      }
+    }
+  }
+
+  /**
+   * Send one command to the persistent helper.
+   * @param payload - command fields (`kind`, `action`, `appId`, `volume`, `muted`, `positionMs`).
+   * @param timeoutMs - command deadline.
+   * @returns the helper answer.
+   */
+  command(payload, timeoutMs = 6000) {
+    this.ensureHelper()
+    const child = this.helper
+    if (child === null || child.stdin === null || child.stdin.destroyed) {
+      return Promise.resolve({ ok: false, error: 'helper-unavailable' })
+    }
+    const requestId = ++this.helperSeq
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        if (this.helperPending.delete(requestId)) resolve({ ok: false, error: 'timeout' })
+      }, timeoutMs)
+      if (typeof timer.unref === 'function') timer.unref()
+      this.helperPending.set(requestId, { resolve, timer })
+      try {
+        child.stdin.write(
+          `${JSON.stringify({ ...payload, requestId })}\n`,
+          error => {
+            if (error === null || error === undefined) return
+            const pending = this.helperPending.get(requestId)
+            if (pending !== undefined) {
+              this.helperPending.delete(requestId)
+              clearTimeout(pending.timer)
+              pending.resolve({ ok: false, error: 'write-failed' })
+            }
+          },
+        )
+      } catch {
+        const pending = this.helperPending.get(requestId)
+        if (pending !== undefined) {
+          this.helperPending.delete(requestId)
+          clearTimeout(pending.timer)
+          pending.resolve({ ok: false, error: 'write-failed' })
+        }
+      }
+    })
+  }
+
+  /** Release the helper process. */
+  stopHelper() {
+    if (this.helperTimer !== null) {
+      clearTimeout(this.helperTimer)
+      this.helperTimer = null
+    }
+    const child = this.helper
+    this.helper = null
+    this.helperBuffer = ''
+    for (const [requestId, pending] of this.helperPending) {
+      clearTimeout(pending.timer)
+      pending.resolve({ ok: false, error: 'stopped' })
+      this.helperPending.delete(requestId)
+    }
+    if (child !== null) {
+      try {
+        child.kill()
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  /** Restart the helper after a crash while the widget is open. */
+  handleHelperExit() {
+    for (const [requestId, pending] of this.helperPending) {
+      clearTimeout(pending.timer)
+      pending.resolve({ ok: false, error: 'helper-stopped' })
+      this.helperPending.delete(requestId)
+    }
+    if (this.disposed || this.subscribers.size === 0 || !IS_WINDOWS) return
+    if (this.helperTimer !== null) return
+    const delay = RESTART_DELAYS_MS[Math.min(this.helperAttempt, RESTART_DELAYS_MS.length - 1)]
+    this.helperAttempt += 1
+    this.helperTimer = setTimeout(() => {
+      this.helperTimer = null
+      if (!this.disposed && this.subscribers.size > 0) this.ensureHelper()
+    }, delay)
+    if (typeof this.helperTimer.unref === 'function') this.helperTimer.unref()
+  }
+
   /** Register one stream listener and keep the helper alive. */
   subscribe(send) {
     this.subscribers.add(send)
+    this.artSent.set(send, new Map())
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer)
       this.idleTimer = null
     }
     this.ensureStarted()
+    this.ensureHelper()
     return () => {
       this.subscribers.delete(send)
+      this.artSent.delete(send)
       if (this.subscribers.size === 0) this.scheduleIdleStop()
     }
   }
@@ -656,6 +898,7 @@ class MusicHub {
       this.idleTimer = null
       if (this.subscribers.size === 0) {
         this.stopWatcher()
+        this.stopHelper()
         this.snapshot = pendingSnapshot()
       }
     }, IDLE_STOP_MS)
@@ -683,198 +926,6 @@ class MusicHub {
     })
   }
 
-  /** Run one control command against a session that is currently present. */
-  async control(id, appId, action, positionMs) {
-    if (this.unsupported) return { ok: false, error: 'unsupported' }
-    if (typeof id !== 'string' || id === '' || id.length > 240) {
-      return { ok: false, error: 'invalid-target' }
-    }
-    if (typeof appId !== 'string' || appId === '' || appId.length > 200) {
-      return { ok: false, error: 'invalid-target' }
-    }
-    if (!ACTIONS.has(action)) return { ok: false, error: 'invalid-action' }
-    let seek = 0
-    if (action === 'seek') {
-      if (!Number.isFinite(positionMs)) return { ok: false, error: 'invalid-position' }
-      seek = Math.max(0, Math.min(86_400_000, Math.round(positionMs)))
-    }
-    const session = this.snapshot.sessions.find(item => item.id === id && item.appId === appId)
-    if (session === undefined) return { ok: false, error: 'not-found' }
-    if (this.pendingActions.has(id)) return { ok: false, error: 'busy' }
-    this.pendingActions.add(id)
-    try {
-      return await this.runControlScript(appId, action, occurrenceOf(id), seek)
-    } finally {
-      this.pendingActions.delete(id)
-    }
-  }
-
-  /** Spawn the one-shot control script and parse its answer. */
-  runControlScript(appId, action, occurrence, positionMs = 0) {
-    return new Promise(resolve => {
-      let child
-      try {
-        child = spawn(
-          POWERSHELL,
-          [
-            '-NoProfile',
-            '-NonInteractive',
-            '-ExecutionPolicy',
-            'Bypass',
-            '-File',
-            CONTROL_SCRIPT,
-            '-AppId',
-            appId,
-            '-Action',
-            action,
-            '-Index',
-            String(occurrence),
-            '-PositionMs',
-            String(positionMs),
-          ],
-          { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
-        )
-      } catch (error) {
-        resolve({ ok: false, error: 'spawn-failed', message: text(String(error), 300) })
-        return
-      }
-      let stdout = ''
-      let stderr = ''
-      let settled = false
-
-      const finish = value => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve(value)
-      }
-      const timer = setTimeout(() => {
-        try {
-          child.kill()
-        } catch {
-          /* already gone */
-        }
-        finish({ ok: false, error: 'timeout' })
-      }, CONTROL_TIMEOUT_MS)
-      if (typeof timer.unref === 'function') timer.unref()
-
-      child.stdout?.on('data', chunk => {
-        stdout = (stdout + String(chunk)).slice(-16_000)
-      })
-      child.stderr?.on('data', chunk => {
-        stderr = (stderr + String(chunk)).slice(-16_000)
-      })
-      child.on('error', error => {
-        finish({ ok: false, error: 'spawn-failed', message: text(String(error), 300) })
-      })
-      child.on('close', () => {
-        const lines = stdout
-          .split(/\r?\n/)
-          .map(line => line.trim())
-          .filter(line => line.startsWith('{'))
-        for (let index = lines.length - 1; index >= 0; index -= 1) {
-          try {
-            const answer = JSON.parse(lines[index])
-            if (answer !== null && typeof answer === 'object') {
-              finish({
-                ok: answer.ok === true,
-                error: answer.ok === true ? undefined : text(answer.error, 120) || 'rejected',
-              })
-              return
-            }
-          } catch {
-            /* keep looking for the last JSON answer */
-          }
-        }
-        finish({
-          ok: false,
-          error: 'no-answer',
-          message: text(stderr.trim().split(/\r?\n/)[0] ?? '', 300),
-        })
-      })
-    })
-  }
-
-  /**
-   * Read or change the default playback device's master volume.
-   * @param action - `get`, `set`, `mute`, `unmute`, or `toggle`.
-   * @param value - 0–100 for `set`.
-   * @returns the volume state or an error.
-   */
-  runVolumeScript(action, value) {
-    return new Promise(resolve => {
-      let child
-      try {
-        child = spawn(
-          POWERSHELL,
-          [
-            '-NoProfile',
-            '-NonInteractive',
-            '-ExecutionPolicy',
-            'Bypass',
-            '-File',
-            VOLUME_SCRIPT,
-            '-Action',
-            action,
-            '-Value',
-            String(value),
-          ],
-          { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
-        )
-      } catch (error) {
-        resolve({ ok: false, error: 'spawn-failed' })
-        return
-      }
-      let stdout = ''
-      let settled = false
-      const finish = result => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve(result)
-      }
-      const timer = setTimeout(() => {
-        try {
-          child.kill()
-        } catch {
-          /* already gone */
-        }
-        finish({ ok: false, error: 'timeout' })
-      }, 8000)
-      if (typeof timer.unref === 'function') timer.unref()
-      child.stdout?.on('data', chunk => {
-        stdout = (stdout + String(chunk)).slice(-16_000)
-      })
-      child.stderr?.on('data', () => {
-        /* the JSON answer is enough; diagnostics stay out of the UI */
-      })
-      child.on('error', () => finish({ ok: false, error: 'spawn-failed' }))
-      child.on('close', () => {
-        const lines = stdout
-          .split(/\r?\n/)
-          .map(line => line.trim())
-          .filter(line => line.startsWith('{'))
-        for (let index = lines.length - 1; index >= 0; index -= 1) {
-          try {
-            const answer = JSON.parse(lines[index])
-            if (answer !== null && typeof answer === 'object') {
-              finish({
-                ok: answer.ok === true,
-                volume: Number.isFinite(answer.volume) ? Math.max(0, Math.min(100, Math.round(answer.volume))) : undefined,
-                muted: answer.muted === true,
-                error: answer.ok === true ? undefined : text(answer.error, 80) || 'volume-failed',
-              })
-              return
-            }
-          } catch {
-            /* keep looking */
-          }
-        }
-        finish({ ok: false, error: 'no-answer' })
-      })
-    })
-  }
-
   /** Stop everything owned by the plugin. */
   dispose() {
     this.disposed = true
@@ -887,6 +938,7 @@ class MusicHub {
       this.idleTimer = null
     }
     this.stopWatcher()
+    this.stopHelper()
     this.subscribers.clear()
   }
 }
@@ -919,11 +971,23 @@ export function apply(ctx) {
     const appId = typeof body?.appId === 'string' ? body.appId : ''
     const action = typeof body?.action === 'string' ? body.action : ''
     const positionMs = typeof body?.positionMs === 'number' ? body.positionMs : undefined
-    return jsonResponse(200, await hub.control(id, appId, action, positionMs))
+    if (appId === '' || !ACTIONS.has(action)) {
+      return jsonResponse(400, { ok: false, error: 'invalid-action' })
+    }
+    return jsonResponse(
+      200,
+      await hub.command({ kind: 'control', id, appId, action, positionMs }),
+    )
   })
 
   register('/api/dsh-music/volume', ['GET', 'POST'], async request => {
-    if (request.method === 'GET') return jsonResponse(200, await hub.runVolumeScript('get', 0))
+    if (request.method === 'GET') {
+      const url = new URL(request.url)
+      return jsonResponse(
+        200,
+        await hub.command({ kind: 'volume.get', appId: url.searchParams.get('appId') ?? '' }),
+      )
+    }
     let body
     try {
       body = await request.json()
@@ -937,15 +1001,15 @@ export function apply(ctx) {
     if (volume === undefined && muted === undefined) {
       return jsonResponse(400, { ok: false, error: 'invalid-volume' })
     }
-    let result = { ok: true }
-    if (volume !== undefined) {
-      result = await hub.runVolumeScript('set', volume)
-      if (!result.ok) return jsonResponse(200, result)
-    }
-    if (muted !== undefined) {
-      result = await hub.runVolumeScript(muted ? 'mute' : 'unmute', 0)
-    }
-    return jsonResponse(200, result)
+    return jsonResponse(
+      200,
+      await hub.command({
+        kind: 'volume.set',
+        appId: typeof body?.appId === 'string' ? body.appId : '',
+        volume,
+        muted,
+      }),
+    )
   })
 
   register('/api/dsh-music/stream', ['GET'], async request => {
@@ -979,7 +1043,7 @@ export function apply(ctx) {
         }
 
         unsubscribe = hub.subscribe(send)
-        send(hub.snapshot)
+        hub.sendInitial(send)
         heartbeat = setInterval(() => {
           if (closed) return
           try {

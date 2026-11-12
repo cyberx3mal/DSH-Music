@@ -3,5 +3,10 @@ debug.log
 .reload*/
 .probe/
 .check*/
+.naudio/
 *.bak
 node_modules/
+.helper-test.cjs
+.peak-proto.ps1
+.session-proto.ps1
+docs/full.png

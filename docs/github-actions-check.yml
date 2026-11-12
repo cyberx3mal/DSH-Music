@@ -1,0 +1,43 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Syntax check JavaScript
+        run: |
+          node --check index.js
+          node --check client.js
+
+      - name: Syntax check PowerShell
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in @('smtc-watcher.ps1', 'music-helper.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "Errors in $file"
+              $errors | ForEach-Object { Write-Host $_.Message }
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Validate JSON
+        run: |
+          node -e "const fs=require('node:fs'); for (const file of ['package.json','locale/en.json','locale/ru.json']) JSON.parse(fs.readFileSync(file,'utf8'))"
+
+      - name: Package dry run
+        run: npm pack --dry-run

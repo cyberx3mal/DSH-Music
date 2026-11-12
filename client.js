@@ -33,6 +33,7 @@ window.__ModuleLoader__.load({
         openSource: 'Open {app} in the player',
         otherSources: 'More sources',
         volume: 'Volume',
+        appVolume: 'App volume',
         systemVolume: 'System volume',
         mute: 'Mute',
         unmute: 'Unmute',
@@ -57,6 +58,7 @@ window.__ModuleLoader__.load({
         openSource: 'Открыть {app} в плеере',
         otherSources: 'Другие источники',
         volume: 'Громкость',
+        appVolume: 'Громкость приложения',
         systemVolume: 'Системная громкость',
         mute: 'Выключить звук',
         unmute: 'Включить звук',
@@ -108,6 +110,7 @@ window.__ModuleLoader__.load({
           artist: text(row.artist, 200),
           album: text(row.album, 200),
           art: typeof row.art === 'string' && /^data:image\//.test(row.art) ? row.art : '',
+          artIncluded: Object.prototype.hasOwnProperty.call(row, 'art'),
           status,
           positionMs: Math.min(millis(row.positionMs), durationMs > 0 ? durationMs : 86_400_000),
           durationMs,
@@ -125,16 +128,24 @@ window.__ModuleLoader__.load({
      * @param message - decoded SSE message.
      * @returns the next snapshot, or undefined when the message is not a snapshot.
      */
-    function nextSnapshot(message) {
+    function nextSnapshot(message, previous) {
       if (message === null || typeof message !== 'object') return undefined
       if (message.supported === false) {
         return { supported: false, ready: true, sessions: [], at: Date.now() }
       }
       if (!Array.isArray(message.sessions)) return undefined
+      const sessions = normalizeSessions(message.sessions)
+      if (previous !== undefined && Array.isArray(previous.sessions)) {
+        for (const session of sessions) {
+          if (session.art !== '' || session.artIncluded) continue
+          const before = previous.sessions.find(item => item.id === session.id)
+          if (before !== undefined && before.art !== '') session.art = before.art
+        }
+      }
       return {
         supported: true,
         ready: true,
-        sessions: normalizeSessions(message.sessions),
+        sessions,
         at: typeof message.at === 'number' ? message.at : Date.now(),
       }
     }
@@ -145,7 +156,10 @@ window.__ModuleLoader__.load({
      */
     function createMusicStore() {
       let snapshot = { supported: true, ready: false, sessions: [], at: 0 }
+      let level = 0
+      let bands = []
       const listeners = new Set()
+      const levelListeners = new Set()
       let controller = null
       let retryTimer = null
       let retryCount = 0
@@ -211,7 +225,26 @@ window.__ModuleLoader__.load({
               } catch {
                 continue
               }
-              const next = nextSnapshot(message)
+              if (message?.type === 'level') {
+                const value = Number(message.value)
+                if (Number.isFinite(value)) {
+                  level = Math.max(0, Math.min(1, value))
+                  bands = Array.isArray(message.bands)
+                    ? message.bands
+                        .slice(0, 32)
+                        .map(band => (Number.isFinite(band) ? Math.max(0, Math.min(1, band)) : 0))
+                    : []
+                  for (const listener of [...levelListeners]) {
+                    try {
+                      listener()
+                    } catch (error) {
+                      console.error('[music-board] level listener', error)
+                    }
+                  }
+                }
+                continue
+              }
+              const next = nextSnapshot(message, snapshot)
               if (next !== undefined) publish(next)
             }
           }
@@ -247,9 +280,10 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const getVolume = async () => {
+      const getVolume = async (appId) => {
         try {
-          const response = await fetch(VOLUME_PATH, {
+          const query = typeof appId === 'string' && appId !== '' ? `?appId=${encodeURIComponent(appId)}` : ''
+          const response = await fetch(VOLUME_PATH + query, {
             method: 'GET',
             credentials: 'same-origin',
             cache: 'no-store',
@@ -283,10 +317,18 @@ window.__ModuleLoader__.load({
 
       return {
         getSnapshot: () => snapshot,
+        getLevel: () => level,
+        getBands: () => bands,
         subscribe(listener) {
           listeners.add(listener)
           return () => {
             listeners.delete(listener)
+          }
+        },
+        subscribeLevel(listener) {
+          levelListeners.add(listener)
+          return () => {
+            levelListeners.delete(listener)
           }
         },
         start() {
@@ -642,25 +684,29 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** Barely visible equalizer bars behind the expanded widget. */
+    /** Audio-reactive equalizer bars behind the expanded widget. */
     function BackgroundEq(props) {
+      const level = React.useSyncExternalStore(props.music.subscribeLevel, props.music.getLevel)
+      const bands = props.music.getBands()
       const bars = []
       for (let index = 0; index < 28; index += 1) {
+        const band = bands.length > 0 ? bands[Math.floor((index * bands.length) / 28)] : 0
+        const source = band > 0.01 ? band : level
+        const energy = props.playing ? Math.max(0.08, Math.min(1, source * 1.25)) : 0.1
+        const factor = 0.55 + ((index * 13) % 40) / 100
         bars.push(
           h('span', {
             key: index,
             className: 'mb-bgEqBar',
             style: {
-              height: `${10 + ((index * 29) % 36)}px`,
-              animationDelay: `${((index % 9) * 0.062).toFixed(3)}s`,
-              animationDuration: `${(0.42 + ((index * 7) % 20) / 100).toFixed(2)}s`,
+              height: `${Math.max(3, Math.round((7 + ((index * 29) % 34)) * (0.25 + energy * 0.75) * factor))}px`,
             },
           }),
         )
       }
       return h(
         'div',
-        { className: 'mb-bgEq', 'data-playing': props.playing ? 'true' : 'false', 'aria-hidden': 'true' },
+        { className: 'mb-bgEq', 'data-playing': props.playing ? 'true' : 'false', 'data-level': level.toFixed(3), 'aria-hidden': 'true' },
         bars,
       )
     }
@@ -683,6 +729,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState(null)
       const [volume, setVolume] = React.useState(null)
       const [muted, setMuted] = React.useState(false)
+      const [volumeScope, setVolumeScope] = React.useState('system')
       const [volumeOpen, setVolumeOpen] = React.useState(false)
       const [volumeAnchor, setVolumeAnchor] = React.useState({ left: 0, top: 0, width: 184 })
       const [scrub, setScrub] = React.useState(null)
@@ -690,6 +737,8 @@ window.__ModuleLoader__.load({
       const volumeTimer = React.useRef(null)
       const scrubTimer = React.useRef(null)
       const volumePopRef = React.useRef(null)
+      const volumeTriggerRef = React.useRef(null)
+      const volumeRangeRef = React.useRef(null)
 
       const view = React.useMemo(() => deriveView(snapshot.sessions), [snapshot])
       const primary = view.rows.find(session => session.id === selectedId) ?? view.primary
@@ -710,17 +759,18 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         let cancelled = false
-        void music.getVolume().then(answer => {
+        void music.getVolume(primary?.appId ?? '').then(answer => {
           if (cancelled) return
           if (answer !== null && answer.ok === true && Number.isFinite(answer.volume)) {
             setVolume(Math.max(0, Math.min(100, Math.round(answer.volume))))
             setMuted(answer.muted === true)
+            setVolumeScope(answer.scope === 'app' ? 'app' : 'system')
           }
         })
         return () => {
           cancelled = true
         }
-      }, [music])
+      }, [music, primary?.appId])
 
       React.useEffect(() => {
         if (!volumeOpen) return undefined
@@ -728,16 +778,36 @@ window.__ModuleLoader__.load({
           const popover = volumePopRef.current
           if (popover !== null && popover.contains(event.target)) return
           if (event.target instanceof Element && event.target.closest('[data-volume-button="true"]') !== null) return
-          setVolumeOpen(false)
+          closeVolumePopover(false)
         }
         const onKeyDown = event => {
-          if (event.key === 'Escape') setVolumeOpen(false)
+          if (event.key === 'Escape') closeVolumePopover(true)
         }
         document.addEventListener('pointerdown', onPointerDown, true)
         document.addEventListener('keydown', onKeyDown)
         return () => {
           document.removeEventListener('pointerdown', onPointerDown, true)
           document.removeEventListener('keydown', onKeyDown)
+        }
+      }, [volumeOpen])
+
+      React.useEffect(() => {
+        if (!volumeOpen) return undefined
+        const frame = requestAnimationFrame(() => volumeRangeRef.current?.focus())
+        const reposition = () => {
+          const trigger = volumeTriggerRef.current
+          if (trigger === null || !trigger.isConnected) {
+            closeVolumePopover(false)
+            return
+          }
+          positionVolumePopover(trigger.getBoundingClientRect())
+        }
+        window.addEventListener('resize', reposition)
+        window.addEventListener('scroll', reposition, true)
+        return () => {
+          cancelAnimationFrame(frame)
+          window.removeEventListener('resize', reposition)
+          window.removeEventListener('scroll', reposition, true)
         }
       }, [volumeOpen])
 
@@ -801,10 +871,11 @@ window.__ModuleLoader__.load({
         if (volumeTimer.current !== null) clearTimeout(volumeTimer.current)
         volumeTimer.current = setTimeout(() => {
           volumeTimer.current = null
-          void music.setVolume({ volume: value }).then(answer => {
+          void music.setVolume({ volume: value, appId: primary?.appId ?? '' }).then(answer => {
             if (answer !== null && answer.ok === true) {
               if (Number.isFinite(answer.volume)) setVolume(Math.max(0, Math.min(100, Math.round(answer.volume))))
               setMuted(answer.muted === true)
+              setVolumeScope(answer.scope === 'app' ? 'app' : 'system')
             }
           })
         }, 180)
@@ -813,25 +884,35 @@ window.__ModuleLoader__.load({
       const toggleMute = () => {
         const next = !muted
         setMuted(next)
-        void music.setVolume({ muted: next }).then(answer => {
+        void music.setVolume({ muted: next, appId: primary?.appId ?? '' }).then(answer => {
           if (answer !== null && answer.ok === true) {
             if (Number.isFinite(answer.volume)) setVolume(Math.max(0, Math.min(100, Math.round(answer.volume))))
             setMuted(answer.muted === true)
+            setVolumeScope(answer.scope === 'app' ? 'app' : 'system')
           }
         })
       }
 
-      const toggleVolumePopover = event => {
-        if (volumeOpen) {
-          setVolumeOpen(false)
-          return
-        }
+      const positionVolumePopover = rect => {
         if (typeof window === 'undefined') return
-        const rect = event.currentTarget.getBoundingClientRect()
         const width = Math.min(184, Math.max(120, window.innerWidth - 16))
         const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width))
         const top = rect.top - 58 >= 8 ? rect.top - 58 : rect.bottom + 6
         setVolumeAnchor({ left, top, width })
+      }
+
+      const closeVolumePopover = (focus = true) => {
+        setVolumeOpen(false)
+        if (focus) volumeTriggerRef.current?.focus()
+      }
+
+      const toggleVolumePopover = event => {
+        if (volumeOpen) {
+          closeVolumePopover(true)
+          return
+        }
+        volumeTriggerRef.current = event.currentTarget
+        positionVolumePopover(event.currentTarget.getBoundingClientRect())
         setVolumeOpen(true)
       }
 
@@ -850,6 +931,7 @@ window.__ModuleLoader__.load({
         }, 1600)
       }
 
+      const volumeTitle = volumeScope === 'app' ? tr('appVolume') : tr('systemVolume')
       const volumeButton = h(
         'button',
         {
@@ -858,7 +940,10 @@ window.__ModuleLoader__.load({
           'data-volume-button': 'true',
           'data-muted': muted ? 'true' : 'false',
           'aria-label': tr('volume'),
-          title: tr('systemVolume'),
+          'aria-haspopup': 'dialog',
+          'aria-expanded': volumeOpen ? 'true' : 'false',
+          'aria-controls': 'mb-volume-popover',
+          title: volumeTitle,
           onClick: toggleVolumePopover,
         },
         h(VolumeIcon, { muted }),
@@ -869,7 +954,10 @@ window.__ModuleLoader__.load({
             'div',
             {
               ref: volumePopRef,
+              id: 'mb-volume-popover',
               className: 'mb-volumePop',
+              role: 'dialog',
+              'aria-label': tr('volume'),
               style: { left: volumeAnchor.left, top: volumeAnchor.top, width: volumeAnchor.width },
             },
             h(
@@ -885,6 +973,7 @@ window.__ModuleLoader__.load({
               h(VolumeIcon, { muted }),
             ),
             h('input', {
+              ref: volumeRangeRef,
               type: 'range',
               className: 'mb-volumeRange',
               min: 0,
@@ -893,7 +982,7 @@ window.__ModuleLoader__.load({
               value: volume ?? 0,
               disabled: volume === null,
               'aria-label': tr('volume'),
-              title: tr('systemVolume'),
+              title: volumeTitle,
               onChange: event => applyVolume(Number(event.target.value)),
             }),
             h('span', { className: 'mb-volumeValue' }, volume === null ? '—' : `${volume}%`),
@@ -1137,7 +1226,7 @@ window.__ModuleLoader__.load({
           style: accent === null ? undefined : { '--mb-accent': accent },
         },
         h(StyleSheet),
-        collapsed ? null : h(BackgroundEq, { playing: primary !== undefined && primary.status === 'playing' }),
+        collapsed ? null : h(BackgroundEq, { music, playing: primary !== undefined && primary.status === 'playing' }),
         collapsed
           ? h(
               'div',
@@ -1175,6 +1264,7 @@ window.__ModuleLoader__.load({
                   className: 'mb-collapse',
                   title: tr('collapseWidget'),
                   'aria-label': tr('collapseWidget'),
+                  'aria-expanded': 'true',
                   onClick: toggleCollapsed,
                 },
                 h(Chevron, { open: false }),
@@ -1210,29 +1300,29 @@ window.__ModuleLoader__.load({
 .mb-foot[data-tone='1']{--mb-tone:var(--dsw-alias-state-success-primary);}
 .mb-foot[data-tone='2']{--mb-tone:var(--dsw-alias-state-warn-primary);}
 .mb-foot[data-tone='3']{--mb-tone:var(--dsw-alias-brand-primary);}
-.mb-foot[data-collapsed='true']{height:31px;min-height:31px;padding:4px 5px 3px;justify-content:center;}
+.mb-foot[data-collapsed='true']{height:31px;min-height:31px;padding:3px 5px 2px;justify-content:center;}
 .mb-head{display:flex;align-items:center;gap:4px;padding:0 2px;min-width:0;position:relative;z-index:1;}
-.mb-foot[data-collapsed='true'] .mb-head{padding:0 2px;min-height:22px;}
+.mb-foot[data-collapsed='true'] .mb-head{padding:0 2px;min-height:24px;}
 .mb-expand{display:flex;align-items:center;gap:4px;flex:1;min-width:0;border:0;background:transparent;color:inherit;font:inherit;text-align:left;padding:1px 2px;border-radius:6px;cursor:pointer;}
 @media (hover:hover){.mb-expand:hover{background:color-mix(in srgb,var(--mb-color) 10%,transparent);}}
 .mb-expand:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-headArtist{flex:0 1 auto;min-width:0;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;color:var(--dsw-alias-label-secondary);}
 .mb-headSep{flex:none;font-size:10px;line-height:16px;color:var(--dsw-alias-label-tertiary);}
 .mb-headTitle{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;line-height:16px;font-weight:500;color:var(--dsw-alias-label-primary);}
-.mb-topActions{position:absolute;top:5px;right:5px;z-index:3;display:flex;align-items:center;gap:1px;}\n.mb-collapse{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
+.mb-topActions{position:absolute;top:5px;right:5px;z-index:3;display:flex;align-items:center;gap:1px;}\n.mb-collapse{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
 @media (hover:hover){.mb-collapse:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-collapse:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-collapse .mb-chevronIcon{transform:rotate(90deg);}
 .mb-bgEq{position:absolute;left:0;right:0;bottom:0;height:70px;display:flex;align-items:flex-end;justify-content:space-between;gap:3px;padding:0 6px 4px;pointer-events:none;opacity:.1;color:var(--mb-color);z-index:0;overflow:hidden;}
-.mb-bgEqBar{flex:1 1 0;min-width:2px;max-width:4px;border-radius:3px 3px 0 0;background:currentColor;transform-origin:bottom;animation:mb-bg-eq .5s ease-in-out infinite alternate;}
+.mb-bgEqBar{flex:1 1 0;min-width:2px;max-width:4px;border-radius:3px 3px 0 0;background:currentColor;transition:height .08s linear;}
 .mb-bgEq[data-playing="false"] .mb-bgEqBar{animation-play-state:paused;opacity:.45;}
 @keyframes mb-bg-eq{0%{transform:scaleY(.22)}70%{transform:scaleY(1)}100%{transform:scaleY(.62)}}
 .mb-headControls{display:inline-flex;align-items:center;gap:1px;flex:none;}
-.mb-headButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:20px;height:22px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);padding:0;cursor:pointer;}
+.mb-headButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);padding:0;cursor:pointer;}
 @media (hover:hover){.mb-headButton:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-headButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-headButton:disabled{cursor:default;opacity:.45;background:transparent;}
-.mb-headPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:0;border-radius:999px;background:linear-gradient(135deg,var(--mb-color),color-mix(in srgb,var(--mb-color) 55%,var(--dsw-alias-brand-primary)));color:var(--dsw-alias-label-primary);padding:0;cursor:pointer;box-shadow:0 1px 4px color-mix(in srgb,var(--mb-color) 32%,transparent);}
+.mb-headPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:999px;background:linear-gradient(135deg,color-mix(in srgb,var(--mb-color) 82%,var(--dsw-alias-bg-base)),color-mix(in srgb,var(--mb-color) 58%,var(--dsw-alias-bg-base)));color:var(--dsw-alias-label-primary);padding:0;cursor:pointer;box-shadow:0 1px 4px color-mix(in srgb,var(--mb-color) 32%,transparent);}
 @media (hover:hover){.mb-headPlay:hover{filter:brightness(1.08);}}
 .mb-headPlay:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-headPlay:disabled{cursor:default;opacity:.45;box-shadow:none;}
@@ -1243,7 +1333,7 @@ window.__ModuleLoader__.load({
 .mb-foot[data-single='true'] .mb-list{max-height:none;overflow:visible;}
 .mb-hero{position:relative;display:flex;flex-direction:column;padding:2px 2px 1px;margin:0;border:0;background:transparent;box-shadow:none;overflow:visible;}
 .mb-hero::before{content:'';position:absolute;top:-28px;left:-18px;width:150px;height:130px;border-radius:999px;background:radial-gradient(circle,color-mix(in srgb,var(--mb-color,var(--dsw-alias-brand-primary)) 22%,transparent),transparent 70%);pointer-events:none;}
-.mb-heroTop{position:relative;z-index:1;display:flex;align-items:center;gap:11px;min-width:0;padding-right:50px;}
+.mb-heroTop{position:relative;z-index:1;display:flex;align-items:center;gap:11px;min-width:0;padding-right:56px;}
 .mb-cover{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none;border-radius:9px;color:var(--dsw-alias-label-primary);overflow:hidden;}
 .mb-coverHero{width:56px;height:56px;border-radius:13px;box-shadow:0 6px 18px color-mix(in srgb,var(--mb-color,var(--dsw-alias-brand-primary)) 26%,transparent),inset 0 0 0 .5px color-mix(in srgb,var(--dsw-alias-label-primary) 14%,transparent);}
 .mb-coverSmall{width:30px;height:30px;border-radius:8px;}
@@ -1277,13 +1367,13 @@ window.__ModuleLoader__.load({
 .mb-transportButton:active{background:var(--dsw-alias-interactive-bg-active);}
 .mb-transportButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-transportButton:disabled{cursor:default;opacity:.45;background:transparent;}
-.mb-playButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:999px;background:linear-gradient(135deg,var(--mb-color),color-mix(in srgb,var(--mb-color) 55%,var(--dsw-alias-brand-primary)));color:var(--dsw-alias-label-primary);padding:0;cursor:pointer;box-shadow:0 2px 8px color-mix(in srgb,var(--mb-color) 34%,transparent);}
+.mb-playButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:999px;background:linear-gradient(135deg,color-mix(in srgb,var(--mb-color) 82%,var(--dsw-alias-bg-base)),color-mix(in srgb,var(--mb-color) 58%,var(--dsw-alias-bg-base)));color:var(--dsw-alias-label-primary);padding:0;cursor:pointer;box-shadow:0 2px 8px color-mix(in srgb,var(--mb-color) 34%,transparent);}
 .mb-playButtonHero{width:34px;height:34px;}
 @media (hover:hover){.mb-playButton:hover{filter:brightness(1.08);}}
 .mb-playButton:active{transform:scale(.97);}
 .mb-playButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px;}
 .mb-playButton:disabled{cursor:default;opacity:.45;box-shadow:none;transform:none;}
-.mb-volumeButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
+.mb-volumeButton{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);padding:0;cursor:pointer;}
 @media (hover:hover){.mb-volumeButton:hover{background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--dsw-alias-label-primary);}}
 .mb-volumeButton[data-muted='true']{color:var(--mb-color);}
 .mb-volumeButton:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
@@ -1300,13 +1390,13 @@ window.__ModuleLoader__.load({
 .mb-otherText{display:flex;flex-direction:column;gap:0;min-width:0;flex:1;}
 .mb-otherTitle{font-size:11.5px;line-height:15px;font-weight:500;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .mb-otherApp{font-size:9.5px;line-height:12px;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.mb-otherPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:0;border-radius:999px;background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--mb-color);padding:0;cursor:pointer;}
+.mb-otherPlay{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:999px;background:color-mix(in srgb,var(--mb-color) 14%,transparent);color:var(--mb-color);padding:0;cursor:pointer;}
 @media (hover:hover){.mb-otherPlay:hover{background:color-mix(in srgb,var(--mb-color) 24%,transparent);}}
 .mb-otherPlay:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px;}
 .mb-otherPlay:disabled{cursor:default;opacity:.45;background:transparent;}
 .mb-other[data-pending='true']{opacity:.7;}
 .mb-error{margin:0;padding:2px 5px;color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;}
-@media (prefers-reduced-motion:reduce){.mb-eqBar,.mb-bgEqBar{animation:none;}.mb-progressFill{transition:none;}.mb-playButton:active{transform:none;}}
+@media (prefers-reduced-motion:reduce){.mb-eqBar{animation:none;}.mb-bgEqBar{transition:none;}.mb-progressFill{transition:none;}.mb-playButton:active{transform:none;}}
 `
 
     /** The widget-local stylesheet element. */
