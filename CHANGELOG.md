@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.6 — 2026-11-13
+
+- The widget stays visible for 5 seconds when the media session list is
+  temporarily empty (for example while switching tracks), then hides if there
+  is still nothing to show. This removes the blink during track changes.
+
 ## 1.2.5 — 2026-11-13
 
 - Quiet passages now fall almost to the bottom: the shared floor is reduced,

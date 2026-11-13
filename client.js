@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
     const ACTION_PATH = '/api/dsh-music/action'
     const VOLUME_PATH = '/api/dsh-music/volume'
     const COLLAPSE_KEY = 'music-board:collapsed'
+    const EMPTY_HIDE_DELAY_MS = 5000
     const STATE_RANK = { playing: 0, paused: 1, idle: 2 }
 
     const dictionaries = {
@@ -784,14 +785,53 @@ window.__ModuleLoader__.load({
       const [volumeOpen, setVolumeOpen] = React.useState(false)
       const [volumeAnchor, setVolumeAnchor] = React.useState({ left: 0, top: 0, width: 184 })
       const [scrub, setScrub] = React.useState(null)
+      const [graceVisible, setGraceVisible] = React.useState(false)
       const timers = React.useRef(new Set())
       const volumeTimer = React.useRef(null)
       const scrubTimer = React.useRef(null)
+      const emptyTimer = React.useRef(null)
+      const lastGoodSnapshot = React.useRef(null)
       const volumePopRef = React.useRef(null)
       const volumeTriggerRef = React.useRef(null)
       const volumeRangeRef = React.useRef(null)
 
-      const view = React.useMemo(() => deriveView(snapshot.sessions), [snapshot])
+      const hasSessions = snapshot.ready && snapshot.supported && snapshot.sessions.length > 0
+      const shown =
+        snapshot.supported && (hasSessions ? snapshot : graceVisible ? lastGoodSnapshot.current : null)
+
+      React.useEffect(() => {
+        if (!snapshot.supported) {
+          if (emptyTimer.current !== null) {
+            clearTimeout(emptyTimer.current)
+            emptyTimer.current = null
+          }
+          lastGoodSnapshot.current = null
+          setGraceVisible(false)
+          return
+        }
+        if (hasSessions) {
+          lastGoodSnapshot.current = snapshot
+          if (emptyTimer.current !== null) {
+            clearTimeout(emptyTimer.current)
+            emptyTimer.current = null
+          }
+          if (!graceVisible) setGraceVisible(true)
+          return
+        }
+        if (lastGoodSnapshot.current === null) {
+          if (graceVisible) setGraceVisible(false)
+          return
+        }
+        if (emptyTimer.current === null) {
+          emptyTimer.current = setTimeout(() => {
+            emptyTimer.current = null
+            lastGoodSnapshot.current = null
+            setGraceVisible(false)
+          }, EMPTY_HIDE_DELAY_MS)
+        }
+      }, [snapshot, hasSessions, graceVisible])
+
+      const view = React.useMemo(() => deriveView(shown?.sessions ?? []), [shown])
       const primary = view.rows.find(session => session.id === selectedId) ?? view.primary
       const others = primary === undefined ? [] : view.rows.filter(session => session.id !== primary.id)
       const anyPlaying = !collapsed && view.rows.some(session => session.status === 'playing')
@@ -804,6 +844,7 @@ window.__ModuleLoader__.load({
           timers.current.clear()
           if (volumeTimer.current !== null) clearTimeout(volumeTimer.current)
           if (scrubTimer.current !== null) clearTimeout(scrubTimer.current)
+          if (emptyTimer.current !== null) clearTimeout(emptyTimer.current)
         },
         [],
       )
@@ -869,7 +910,7 @@ window.__ModuleLoader__.load({
       }, [error])
 
       if (!wide) return null
-      if (!snapshot.ready || !snapshot.supported || snapshot.sessions.length === 0) return null
+      if (shown === null || !shown.ready || !shown.supported || shown.sessions.length === 0) return null
 
       const toggleCollapsed = () => {
         setVolumeOpen(false)
@@ -1111,7 +1152,7 @@ window.__ModuleLoader__.load({
         const title = session.title || tr('noTitle')
         const app = appNameOf(session)
         const tone = coverTone(session)
-        const basePosition = displayedPosition(session, snapshot.at, now)
+        const basePosition = displayedPosition(session, shown.at, now)
         const position = scrub !== null && scrub.id === session.id ? scrub.value : basePosition
         const seekable = session.durationMs > 0 && session.canSeek === true
         const rawElapsed = formatClock(position)
